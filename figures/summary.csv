@@ -1,2 +1,2 @@
 dataset,model,best_size,n_params,sizes_tried,seeds,epochs,your_acc,your_acc_sd,paper_acc,paper_acc_sd,diff_pp,tolerance_pp,your_loss,paper_loss,verdict
-fmnist,dANN-LRF,16 dends x 128 somata,38282,1,1,25,88.92,0.0,90.256,0.2237,-1.336,0.5,0.3124,0.2975,lower than paper
+fmnist,dANN-LRF,64 dends x 256 somata,297738,6,5,25,90.136,0.294,90.256,0.2237,-0.12,0.74,0.2919,0.2975,matches paper
