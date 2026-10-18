@@ -13,9 +13,6 @@ Matches the original code:
     - Glorot-uniform init on the full dense weight shape, zero biases, then masked.
     - Adam (lr 1e-3), batch 128, cross-entropy, 90/10 train/validation split, pixels scaled to [0, 1].
     - Epochs: 25 for Fashion-MNIST, 50 for CIFAR-10 (the values in their main.py).
-
-Example:
-    python base_model.py --dataset fmnist --dends 16 --soma 128 --sampling local
 """
 import argparse
 import json
@@ -38,7 +35,10 @@ def neighborhood(shape, center, radius=1, perimeter=False):
     Adapted from nb_vals in receptive_fields.py.
 
     Extract the indices of neighboring elements around a specific center in a matrix.
-    (row, col) pixels within Chebyshev distance `radius` of `center`, clipped to the image."""
+    (row, col) pixels within Chebyshev distance `radius` of `center`, clipped to the image.
+
+    Returns the pixel coordinates around a center pixel.
+    """
     M, N = shape
     r, c = int(center[0]), int(center[1])
     r0, r1 = max(0, r - radius), min(M - 1, r + radius)
@@ -55,7 +55,12 @@ def neighborhood(shape, center, radius=1, perimeter=False):
 def grow_to(shape, center, n, rng):
     """
     Adapted from allocate_synapses in receptive_fields.py.
-    Start from the 3x3 patch around `center`, add pixels from successive rings until there are n."""
+
+    Start from the 3x3 patch around `center`, add pixels from successive rings until there are n.
+
+    For 16 synapses, that is the 9 central pixels plus 7 pixels picked at random from the surrounding ring.
+    This produces a dendrite is receptive field: a small, local patch of the image.
+    """
     idx = neighborhood(shape, center, 1)
     radius = 2
     while len(idx) < n:
@@ -77,7 +82,10 @@ def grow_to(shape, center, n, rng):
 def dendrite_row(shape, center, synapses, channels, rng):
     """
     Adapted from allocate_synapses in receptive_fields.py.
-    Input mask (flattened, channels-last) for one dendrite with a receptive field at `center`."""
+
+    Builds the input mask for one dendrite. It calls _grow_to to choose 16 pixels near center.
+    Then marks those pixels with 1 in an image-sized grid of zeros.
+    """
     m = np.zeros(shape)
     idx = grow_to(shape, center, synapses, rng)
     m[idx[:, 0], idx[:, 1]] = 1
@@ -90,7 +98,9 @@ def synaptic_mask(shape, dends, soma, synapses, channels, sampling, rng):
     """
     Adapted from receptive_fields (line 315) + make_mask_matrix (line 226) + random_connectivity (line 73)
 
-    Input -> dendrite mask, shape (inputs, dends*soma). Dendrites are grouped by soma."""
+    Builds the full input -> dendrite mask, shape (784 inputs x 2,048 dendrites).
+    Dendrites are grouped by soma: the first 16 belong to soma 1, the next 16 to soma 2, and so on
+    """
     M, N = shape
     n_in = M * N * channels
     n_dend = dends * soma
@@ -109,9 +119,6 @@ def synaptic_mask(shape, dends, soma, synapses, channels, sampling, rng):
             rows[k] = dendrite_row(shape, center, synapses, channels, rng)
     elif sampling == "global":
         # dANN-GRF: every soma gets a random center; its dendrites' centers lie around it.
-        # Note: the original code has a loop that never runs here, so with >9 dendrites
-        # per soma the extra dendrites got no inputs. This version grows the
-        # neighborhood as intended, so every dendrite has `synapses` inputs.
         flat = rng.choice(M * N, size=soma, replace=True)
         k = 0
         for center in zip(*np.unravel_index(flat, (M, N))):
@@ -126,13 +133,17 @@ def synaptic_mask(shape, dends, soma, synapses, channels, sampling, rng):
 def cable_mask(dends, soma):
     """
     Adapted from connectivity in receptive_fields.py
-    Dendrite -> soma mask, shape (dends*soma, soma): each dendrite connects to exactly one soma."""
+
+    Builds the dendrite -> soma mask, shape (2,048 x 128).
+    Dendrites 1-16 connect only to soma 1, dendrites 17-32 only to soma 2, and so on.
+    """
     return np.kron(np.eye(soma, dtype=np.int8), np.ones((dends, 1), dtype=np.int8))
 
 
 def grid_shape(n):
     """
     Adapted from make_masks in opt.py
+
     Lay out n somata as a near-square 2D grid (how the original feeds layer i into layer i+1)."""
     divisors = [j for j in range(1, n + 1) if n % j == 0]
     ix = len(divisors) // 2
@@ -170,7 +181,11 @@ class MaskedLinear(nn.Module):
 class DendriticANN(nn.Module):
     """
     Adapted from get_model in opt.py.
-    Chavlis & Poirazi dANN: `layers` dendro-somatic layers + dense output."""
+
+    Chavlis & Poirazi dANN: `layers` dendro-somatic layers + dense output.
+
+    784 pixels -> dendrites (2048) -> LeakyReLU -> somata (128) -> LeakyReLU -> output (10)
+    """
 
     def __init__(self, img_shape, channels, num_classes, dends=16, soma=128,
                  synapses=16, layers=1, sampling="local", relu_slope=0.1, seed=0):
@@ -252,6 +267,10 @@ def pick_device(requested):
 
 @torch.no_grad()
 def evaluate(model, x, y, batch_size):
+    """
+    Runs the model on a dataset without training it and returns average loss and accuracy.
+    Gradients are turned off here, which makes it faster.
+    """
     model.eval()
     total_loss, correct = 0.0, 0
     for i in range(0, len(x), batch_size):
@@ -262,6 +281,19 @@ def evaluate(model, x, y, batch_size):
 
 
 def train(model, data, epochs, lr, batch_size, device, seed):
+    """The training loop. For each epoch it:
+
+    1. Shuffles the training images.
+    2. Goes through them in batches of 128, and for each batch, it:
+        - predicts,
+        - computes cross-entropy loss,
+        - backpropagates,
+        - takes an Adam step with learning rate 0.001.
+    3. Records training loss and accuracy, then calls evaluate on the validation set and
+    prints a progress line.
+
+    4. After the last epoch it evaluates once on the test set. It returns a dictionary of all these numbers."""
+
     to_t = lambda a, dt: torch.as_tensor(a, dtype=dt, device=device)
     xtr, ytr = to_t(data["train"][0], torch.float32), to_t(data["train"][1], torch.long)
     xva, yva = to_t(data["val"][0], torch.float32), to_t(data["val"][1], torch.long)
