@@ -14,6 +14,20 @@ only by seed, and writes to figures/:
     4_learning_curves.png     train/validation curves for the best model of each
                               sampling type (checks convergence and overfitting)
     summary.csv               the numbers behind figure 1
+
+
+    Pass this block of code in your terminals
+
+    caffeinate -i bash -c '
+    for seed in 1 2 3 4 5; do
+    for cfg in "1 256" "4 256" "16 256" "64 256" "16 512"; do
+        read d s <<< "$cfg"
+        out="results/dann_local_fmnist_L1_d${d}_s${s}_seed${seed}.json"
+        if [ -f "$out" ]; then echo "skip $out (already done)"; continue; fi
+        echo "=== seed $seed: $d dendrites x $s somata ==="
+        python base_model.py --dataset fmnist --dends $d --soma $s --seed $seed
+    done
+    done' 2>&1 | tee sweep.log
 """
 import argparse
 import csv

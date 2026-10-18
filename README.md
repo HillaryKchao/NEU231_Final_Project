@@ -1,6 +1,6 @@
 # NEU231_Final_Project
 
-To run the repo folder
+To run the repo model --
 
 python3 -m venv .venv && source .venv/bin/activate
 

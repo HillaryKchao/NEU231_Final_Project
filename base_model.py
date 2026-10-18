@@ -254,7 +254,6 @@ def load_data(name, data_dir, val_split=0.1, seed=0):
 
 ########## Training ##########
 
-
 def pick_device(requested):
     if requested != "auto":
         return torch.device(requested)
