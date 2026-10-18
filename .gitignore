@@ -1,0 +1,12 @@
+# downloaded datasets and training outputs
+data/
+results/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# macOS
+.DS_Store
