@@ -512,8 +512,12 @@ def fig_control_homogeneous(configs, datasets, out):
                 m = np.array([c[metric] for c in cs])
                 sd = np.array([c[f"{metric}_sd"] for c in cs])
                 ax.fill_between(px, m - sd, m + sd, color=NONLIN_COLOR[n], alpha=0.12, lw=0)
+                # error bars as well: with one size per model there is no band to shade
+                ax.errorbar(px, m, yerr=sd, fmt="none", ecolor=NONLIN_COLOR[n], elinewidth=1.2,
+                            capsize=3, alpha=0.8, zorder=2)
                 ax.plot(px, m, color=NONLIN_COLOR[n], marker=NONLIN_STYLE[n]["marker"],
-                        mec=SURFACE, mew=1.2, lw=2.6 if n == "v1" else 2, label=NONLIN_LABEL[n])
+                        mec=SURFACE, mew=1.2, lw=2.6 if n == "v1" else 2, label=NONLIN_LABEL[n],
+                        zorder=3)
                 ends.append((px[-1], m[-1], NONLIN_LABEL[n]))
             if ds in PAPER and s in PAPER[ds]:
                 ax.axhline(PAPER[ds][s][metric][0], color=MUTED, lw=1, ls=(0, (4, 3)),
@@ -531,7 +535,8 @@ def fig_control_homogeneous(configs, datasets, out):
     _finish(fig, out / "7_control_homogeneous.png",
             "Control 1 (homogeneous type): if any single-nonlinearity line matches the black "
             "V1 mixed line, mixing adds nothing. Single-nonlinearity models have the baseline's "
-            "parameter count; V1 mixed has three cable weights per dendrite. Shading: SD over seeds.")
+            "parameter count; V1 mixed has three cable weights per dendrite. Error bars and "
+            "shading: SD over seeds.")
 
 
 def write_control_homogeneous(configs, out):
