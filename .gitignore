@@ -1,6 +1,7 @@
 # downloaded datasets and training outputs
 data/
-results/*.pt   # weights are ~35 MB each; the result JSONs are tracked
+# per-run weights are ~35 MB each; the result JSONs in results/ are tracked
+results/*.pt
 
 # Python
 __pycache__/
