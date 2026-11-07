@@ -12,8 +12,11 @@ With --nonlin v1, the dendritic LeakyReLU is replaced by three fixed V1-style no
 applied in parallel to every dendrite (supralinear, sublinear, calcium spike). The soma then
 learns a weighted sum over all (dendrite, channel) outputs. See V1DendriticNonlinearity.
 --nonlin supra / sub / ca are the "homogeneous type" controls: every dendrite uses just that
-one nonlinearity, with the baseline-sized cable layer. Results are tagged dann_<nonlin>_*;
---nonlin leaky (the default) is the paper's model and keeps the original tag.
+one nonlinearity, with the baseline-sized cable layer. --nonlin branch --mix S:B:C gives each
+dendrite ONE nonlinearity, with the ratio setting how many of a soma's dendrites are supra,
+sub and Ca (12:3:1 at 16 dendrites = 12, 3 and 1); same cable layer as the baseline.
+Results are tagged dann_<nonlin>_* (dann_branch12-3-1_* for ratios); --nonlin leaky (the
+default) is the paper's model and keeps the original tag.
 
 Matches the original code:
     - Masks built the same way (16 synapses per dendrite; random / local-RF / global-RF sampling).
@@ -242,6 +245,74 @@ class V1DendriticNonlinearity(nn.Module):
                 f"ca_thresh={self.ca_thresh}, ca_gain={self.ca_gain}, ca_amp={self.ca_amp}")
 
 
+def parse_mix(mix):
+    """'12:3:1' -> (12.0, 3.0, 1.0): the supra:sub:ca dendrite ratio. Entries >= 0, sum > 0."""
+    try:
+        parts = tuple(float(p) for p in str(mix).split(":"))
+    except ValueError:
+        raise ValueError(f"mix must look like 'S:B:C', got {mix!r}") from None
+    if len(parts) != 3 or any(p < 0 for p in parts) or sum(parts) <= 0:
+        raise ValueError(f"mix must be three non-negative numbers with a positive sum, got {mix!r}")
+    return parts
+
+
+def mix_counts(mix, dends):
+    """Integer dendrite counts (n_supra, n_sub, n_ca) per soma that sum to `dends`.
+
+    Largest-remainder rounding of ratio * dends: 12:3:1 at 16 -> (12, 3, 1);
+    1:1:1 at 16 -> (6, 5, 5); 1:1:0 at 16 -> (8, 8, 0).
+    """
+    ratio = parse_mix(mix)
+    exact = [r / sum(ratio) * dends for r in ratio]
+    counts = [int(math.floor(e)) for e in exact]
+    for k in sorted(range(3), key=lambda k: exact[k] - counts[k], reverse=True)[:dends - sum(counts)]:
+        counts[k] += 1
+    assert sum(counts) == dends
+    return tuple(counts)
+
+
+class BranchTypeNonlinearity(nn.Module):
+    """One V1 nonlinearity per dendrite ("mixed branches").
+
+    The mix ratio supra:sub:ca sets how many of each soma's `dends` dendrites use each
+    nonlinearity; within a soma the first n_supra dendrites are supralinear, the next n_sub
+    sublinear and the rest calcium-spike. Dendrite order is arbitrary (receptive-field centers
+    are random), so the layout is fixed. Input and output are (B, D), so the cable layer keeps
+    the baseline shape and parameter count. No parameters, no RNG.
+    """
+
+    def __init__(self, dends, soma, mix="1:1:1", **constants):
+        super().__init__()
+        self.bank = V1DendriticNonlinearity(**constants)  # all three channels, same constants
+        self.mix, self.counts = str(mix), mix_counts(mix, dends)
+        for name, ratio, n in zip(self.bank.CHANNELS, parse_mix(mix), self.counts):
+            if ratio > 0 and n == 0:
+                print(f"warning: mix {mix} gives 0 {name} dendrites per soma at {dends} dendrites")
+        per_soma = sum(([k] * n for k, n in enumerate(self.counts)), [])
+        type_idx = torch.tensor(per_soma * soma, dtype=torch.long)  # (D,) channel index per dendrite
+        self.register_buffer("type_idx", type_idx)
+        self.register_buffer("onehot", F.one_hot(type_idx, 3).T.float())  # (3, D)
+
+    @property
+    def channels(self):
+        return self.bank.channels
+
+    @property
+    def n_channels(self):  # channels per dendrite reaching the soma
+        return 1
+
+    @property
+    def ca_thresh(self):
+        return self.bank.ca_thresh
+
+    def forward(self, u):
+        h = self.bank(u).view(u.shape[0], 3, -1)  # (B, 3, D), channel-major
+        return (h * self.onehot).sum(1)           # (B, D): each dendrite's own channel
+
+    def extra_repr(self):
+        return f"mix={self.mix} -> counts {self.counts} per soma; {self.bank.extra_repr()}"
+
+
 class DendriticANN(nn.Module):
     """
     Adapted from get_model in opt.py.
@@ -256,18 +327,21 @@ class DendriticANN(nn.Module):
     nonlin="supra" | "sub" | "ca" (homogeneous-type controls):
         as "leaky", but with that single V1 nonlinearity in place of the dendritic LeakyReLU.
         Same cable layer and parameter count as the baseline.
+    nonlin="branch", mix="S:B:C" (per-dendrite ratio):
+        each dendrite uses one V1 nonlinearity; the ratio sets how many of a soma's dendrites
+        are supra, sub and Ca. Same cable layer and parameter count as the baseline.
     """
 
-    NONLINS = ("leaky", "v1", "supra", "sub", "ca")
+    NONLINS = ("leaky", "v1", "supra", "sub", "ca", "branch")
 
     def __init__(self, img_shape, channels, num_classes, dends=16, soma=128,
                  synapses=16, layers=1, sampling="local", relu_slope=0.1, seed=0,
-                 nonlin="leaky", nonlin_params=None):
+                 nonlin="leaky", nonlin_params=None, mix="1:1:1"):
         super().__init__()
         if nonlin not in self.NONLINS:
             raise ValueError(f"nonlin must be one of {self.NONLINS}")
         rng = np.random.default_rng(seed)
-        self.nonlin = nonlin
+        self.nonlin, self.mix = nonlin, mix
         n_ch = 3 if nonlin == "v1" else 1  # channels per dendrite feeding the soma
         self.dend_layers = nn.ModuleList()
         self.soma_layers = nn.ModuleList()
@@ -292,7 +366,9 @@ class DendriticANN(nn.Module):
             self.dend_act = nn.LeakyReLU(relu_slope)
         elif nonlin == "v1":
             self.dend_act = V1DendriticNonlinearity(**(nonlin_params or {}))
-        else:  # one nonlinearity for every dendrite
+        elif nonlin == "branch":  # one nonlinearity per dendrite, mixed within each soma
+            self.dend_act = BranchTypeNonlinearity(dends, soma, mix, **(nonlin_params or {}))
+        else:  # the same single nonlinearity for every dendrite
             self.dend_act = V1DendriticNonlinearity(channels=(nonlin,), **(nonlin_params or {}))
         self.soma_act = nn.LeakyReLU(relu_slope)
 
@@ -308,8 +384,12 @@ class DendriticANN(nn.Module):
 
 ########## Data ##########
 
-def load_data(name, data_dir, val_split=0.1, seed=0):
-    """Return flattened float32 arrays in [0, 1] (channels-last, as in the original)."""
+def load_data(name, data_dir, val_split=0.1, seed=0, train_subset=None):
+    """Return flattened float32 arrays in [0, 1] (channels-last, as in the original).
+
+    train_subset: keep only the first N shuffled training images (after the validation split,
+    which stays full). For quick checks only; such runs are tagged _nN and left out of plots.
+    """
     if name == "fmnist":
         tr = datasets.FashionMNIST(data_dir, train=True, download=True)
         te = datasets.FashionMNIST(data_dir, train=False, download=True)
@@ -332,8 +412,11 @@ def load_data(name, data_dir, val_split=0.1, seed=0):
     order = rng.permutation(len(xtr))
     xtr, ytr = xtr[order], ytr[order]
     n_val = int(val_split * len(xtr))
+    x_train, y_train = xtr[:-n_val], ytr[:-n_val]
+    if train_subset:
+        x_train, y_train = x_train[:train_subset], y_train[:train_subset]
     split = {
-        "train": (xtr[:-n_val], ytr[:-n_val]),
+        "train": (x_train, y_train),
         "val": (xtr[-n_val:], ytr[-n_val:]),
         "test": (xte, yte),
     }
@@ -428,9 +511,13 @@ def main():
                    help="input sampling: random (dANN-R), local RFs (dANN-LRF), global RFs (dANN-GRF)")
     p.add_argument("--nonlin", default="leaky", choices=list(DendriticANN.NONLINS),
                    help="dendritic nonlinearity: leaky (paper, LeakyReLU 0.1); v1 (three fixed "
-                        "channels per dendrite: supralinear, sublinear, Ca spike); or supra / sub "
-                        "/ ca (homogeneous controls: that single channel on every dendrite)")
-    g = p.add_argument_group("dendritic nonlinearity constants (v1, supra, sub, ca)")
+                        "channels per dendrite: supralinear, sublinear, Ca spike); supra / sub "
+                        "/ ca (homogeneous controls: that single channel on every dendrite); or "
+                        "branch (one channel per dendrite, mixed within a soma by --mix)")
+    p.add_argument("--mix", default="1:1:1",
+                   help="supra:sub:ca dendrite ratio per soma, only with --nonlin branch "
+                        "(e.g. 12:3:1 = biological, 1:1:1 = uniform)")
+    g = p.add_argument_group("dendritic nonlinearity constants (v1, supra, sub, ca, branch)")
     g.add_argument("--supra-p", type=float, default=2.0, help="supra(u) = relu(u)**p, p >= 1")
     g.add_argument("--sub-sat", type=float, default=1.0, help="sub(u) = s * tanh(u / s)")
     g.add_argument("--ca-thresh", type=float, default=1.0,
@@ -443,6 +530,9 @@ def main():
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--device", default="auto", help="auto, cpu, cuda, or mps")
     p.add_argument("--data-dir", default="data")
+    p.add_argument("--train-subset", type=int, default=None,
+                   help="train on the first N shuffled training images; for quick checks only "
+                        "(run is tagged _nN and left out of the figures)")
     p.add_argument("--out", default="results")
     args = p.parse_args()
 
@@ -450,15 +540,19 @@ def main():
     device = pick_device(args.device)
     epochs = args.epochs or {"fmnist": 25, "cifar10": 50}[args.dataset]
 
-    data, img_shape, channels, n_classes = load_data(args.dataset, args.data_dir, seed=args.seed)
+    data, img_shape, channels, n_classes = load_data(args.dataset, args.data_dir, seed=args.seed,
+                                                     train_subset=args.train_subset)
     nonlin_params = dict(supra_p=args.supra_p, sub_sat=args.sub_sat, ca_thresh=args.ca_thresh,
                          ca_gain=args.ca_gain, ca_amp=args.ca_amp)
     model = DendriticANN(img_shape, channels, n_classes, dends=args.dends, soma=args.soma,
                          synapses=args.synapses, layers=args.layers, sampling=args.sampling,
-                         seed=args.seed, nonlin=args.nonlin, nonlin_params=nonlin_params).to(device)
+                         seed=args.seed, nonlin=args.nonlin, nonlin_params=nonlin_params,
+                         mix=args.mix).to(device)
 
     print(f"dANN-{args.sampling} | {args.nonlin} dendrites | {args.dataset} | {args.layers} layer(s) | "
           f"{args.dends} dends x {args.soma} somata | {model.n_params():,} trainable params | {device}")
+    print(f"images: train {len(data['train'][0]):,} | val {len(data['val'][0]):,} | "
+          f"test {len(data['test'][0]):,}" + ("  (TRAIN SUBSET)" if args.train_subset else ""))
     hist = train(model, data, epochs, args.lr, args.batch_size, device, args.seed)
     print(f"\nTest acc: {hist['test_acc']:.4f} | Test loss: {hist['test_loss']:.4f}")
 
@@ -466,8 +560,10 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     # The paper baseline keeps its original tag; other nonlinearities are named (dann_v1_...).
     nl = "" if args.nonlin == "leaky" else f"_{args.nonlin}"
+    if args.nonlin == "branch":
+        nl += args.mix.replace(":", "-")  # dann_branch12-3-1_...
     tag = (f"dann{nl}_{args.sampling}_{args.dataset}_L{args.layers}_d{args.dends}_s{args.soma}"
-           f"_seed{args.seed}")
+           f"_seed{args.seed}" + (f"_n{args.train_subset}" if args.train_subset else ""))
     hist.update(vars(args), n_params=model.n_params(), epochs=epochs)
     (out / f"{tag}.json").write_text(json.dumps(hist, indent=2))
     torch.save(model.state_dict(), out / f"{tag}.pt")

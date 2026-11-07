@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
 """
-Inspect trained dANNs that use the V1 dendritic nonlinearities (`--nonlin v1`, or the
-single-channel controls `supra`, `sub`, `ca`): which of the nonlinearities does each soma
-actually use, and do the dendrites ever reach the calcium-spike threshold?
+Inspect trained dANNs that use the V1 dendritic nonlinearities (`--nonlin v1`, the
+single-channel controls `supra`, `sub`, `ca`, or the per-dendrite ratio mode `branch`):
+which of the nonlinearities does each soma actually use, and do the dendrites ever reach
+the calcium-spike threshold?
 
     python analyze_v1.py results/dann_v1_local_fmnist_L1_d16_s256_seed1 [more tags ...]
                          [--data-dir data] [--out figures]
 
 For every tag (a results path without .json/.pt) it prints, per layer, the fraction of each
-soma's absolute cable weight that reads each channel (only meaningful for v1, which has
-three channels per dendrite), and how many somata are dominated by each channel. With
---data-dir it also pushes one validation batch through the first dendritic layer and reports
-the scale of the dendritic pre-activations u, the fraction of them above the Ca threshold, and
-each channel's share of the actual drive to the somata (mean |w * f_k(u)| over the batch),
-which accounts for the channels' different output scales.
+soma's absolute cable weight that reads each nonlinearity, and how many somata are dominated
+by each. For v1 the channels are the three outputs of every dendrite; for branch they are
+the dendrites of each type (so this shows whether a soma downweights, say, its Ca dendrite).
+With --data-dir it also pushes one validation batch through the first dendritic layer and
+reports the scale of the dendritic pre-activations u, the fraction above the Ca threshold,
+and each nonlinearity's share of the actual drive to the somata (mean |w * f(u)| over the
+batch), which accounts for the channels' different output scales.
 
 Figures (for the first tag):
     5_v1_nonlinearities.png   the f_k(u) curves of that run's channels, with its constants
-    6_v1_channel_usage.png    per-soma stacked bars of the cable-weight fractions (v1 only)
+    6_v1_channel_usage_by_{supra,sub,ca}.png
+                              per-soma stacked bars of the cable-weight fractions (v1 and
+                              branch runs), somata sorted by that channel's share
 """
 import argparse
 import json
@@ -26,13 +30,13 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from base_model import DendriticANN, V1DendriticNonlinearity, load_data
+from base_model import DendriticANN, load_data
 from plot_results import COLOR, GRID, INK_2, MUTED, SURFACE, _finish, plt
 
 IMG = {"fmnist": ((28, 28), 1), "cifar10": ((32, 32), 3)}
 CHANNEL_COLOR = {"supra": COLOR["global"], "sub": COLOR["local"], "ca": COLOR["random"]}
 NONLIN_KEYS = ("supra_p", "sub_sat", "ca_thresh", "ca_gain", "ca_amp")
-BANK_NONLINS = ("v1", "supra", "sub", "ca")
+BANK_NONLINS = ("v1", "supra", "sub", "ca", "branch")
 
 
 def load(tag):
@@ -45,20 +49,36 @@ def load(tag):
     img_shape, channels = IMG[r["dataset"]]
     model = DendriticANN(img_shape, channels, 10, dends=r["dends"], soma=r["soma"],
                          synapses=r["synapses"], layers=r["layers"], sampling=r["sampling"],
-                         seed=r["seed"], nonlin=nonlin,
+                         seed=r["seed"], nonlin=nonlin, mix=r.get("mix", "1:1:1"),
                          nonlin_params={k: r[k] for k in NONLIN_KEYS})
     model.load_state_dict(torch.load(tag.with_suffix(".pt"), map_location="cpu"))
     model.eval()
     return model, r
 
 
+def row_groups(act, D):
+    """Which rows of the cable weight belong to each nonlinearity, and their names.
+
+    v1:     channel-major blocks of D rows, one per channel.
+    branch: the rows (dendrites) whose type is that channel.
+    single: one group holding everything.
+    """
+    if hasattr(act, "type_idx"):
+        return [(name, act.type_idx == k) for k, name in enumerate(act.channels)]
+    masks = []
+    for k, name in enumerate(act.channels):
+        m = torch.zeros(act.n_channels * D, dtype=torch.bool)
+        m[k * D:(k + 1) * D] = True
+        masks.append((name, m))
+    return masks
+
+
 @torch.no_grad()
-def channel_weight_fraction(soma_layer, dends, soma, n_ch):
-    """(n_ch, soma): share of each soma's absolute cable weight on each channel."""
-    D = dends * soma
-    W = (soma_layer.weight * soma_layer.mask).abs()  # (n_ch * D, soma), channel-major rows
-    per_ch = torch.stack([W[k * D:(k + 1) * D].sum(0) for k in range(n_ch)])
-    return per_ch / per_ch.sum(0).clamp_min(1e-12)
+def channel_weight_fraction(soma_layer, groups):
+    """(n_groups, soma): share of each soma's absolute cable weight on each nonlinearity."""
+    W = (soma_layer.weight * soma_layer.mask).abs()
+    per = torch.stack([W[m].sum(0) for _, m in groups])
+    return per / per.sum(0).clamp_min(1e-12)
 
 
 def report_fractions(frac, names, title):
@@ -72,29 +92,30 @@ def report_fractions(frac, names, title):
 
 @torch.no_grad()
 def report_activity(model, r, data_dir, n=2048):
-    """Push validation images through layer 0 and report what the channels actually do."""
+    """Push validation images through layer 0 and report what the nonlinearities actually do."""
     data, *_ = load_data(r["dataset"], data_dir, seed=r["seed"])
     x = torch.as_tensor(data["val"][0][:n])
-    bank = model.dend_act
-    names = bank.channels
+    act = model.dend_act
     u = model.dend_layers[0](x)                          # (n, D)
-    h = bank(u)                                          # (n, n_ch * D)
-    D = u.shape[1]
+    h = act(u)                                           # (n, n_ch * D)
     W = model.soma_layers[0].weight * model.soma_layers[0].mask  # (n_ch * D, soma)
-    # Actual drive each channel delivers to the somata, averaged over images and somata
-    drive = torch.stack([(h[:, k * D:(k + 1) * D] @ W[k * D:(k + 1) * D]).abs().mean()
-                         for k in range(len(names))])
+    groups = row_groups(act, u.shape[1])
+    # Actual drive each nonlinearity delivers to the somata, averaged over images and somata
+    drive = torch.stack([(h[:, m] @ W[m]).abs().mean() for _, m in groups])
     share = drive / drive.sum().clamp_min(1e-12)
-    above = (u > bank.ca_thresh).float()
+    above = (u > act.ca_thresh).float()
     print(f"  activity on {n} validation images (layer 0):")
     print(f"    u: mean {u.mean():.3f}  sd {u.std():.3f}  max {u.max():.3f}  "
           f"frac(u > 0) {(u > 0).float().mean():.3f}")
-    print(f"    Ca threshold {bank.ca_thresh}: frac of (image, dendrite) above {above.mean():.4f}; "
+    print(f"    Ca threshold {act.ca_thresh}: frac of (image, dendrite) above {above.mean():.4f}; "
           f"frac of dendrites ever above {(above.max(0).values.mean()):.4f}")
-    for k, name in enumerate(names):
-        print(f"    {name:5s}  mean |output| {h[:, k * D:(k + 1) * D].abs().mean():.4f}  "
+    for k, (name, m) in enumerate(groups):
+        if not m.any():
+            print(f"    {name:5s}  no dendrites of this type")
+            continue
+        print(f"    {name:5s}  mean |output| {h[:, m].abs().mean():.4f}  "
               f"share of somatic drive {share[k]:.3f}")
-    if "ca" in names and above.mean() < 1e-3:
+    if "ca" in [g[0] for g in groups] and above.mean() < 1e-3:
         print("    note: the Ca channel almost never fires; try a lower --ca-thresh")
 
 
@@ -118,25 +139,28 @@ def fig_curves(bank, path):
                        "carries the linear term.")
 
 
-def fig_usage(frac, names, path, label):
+def fig_usage(frac, names, path, label, sort_by, note):
+    """Stacked bars of each soma's channel shares, somata sorted by one channel's share."""
     frac = frac.numpy()
-    order = np.argsort(-frac[0])  # sort somata by their first channel's share
+    order = np.argsort(-frac[names.index(sort_by)])
+    # the sorted channel goes at the bottom of the stack so its share reads as one clean edge
+    stack = [sort_by] + [n for n in names if n != sort_by]
     fig, ax = plt.subplots(figsize=(8, 3.4))
     bottom = np.zeros(frac.shape[1])
     xs = np.arange(frac.shape[1])
-    for k, name in enumerate(names):
+    for name in stack:
+        k = names.index(name)
         ax.bar(xs, frac[k, order], bottom=bottom, width=1.0, color=CHANNEL_COLOR[name],
                label=f"{name} (mean {frac[k].mean():.2f})", lw=0)
         bottom += frac[k, order]
     ax.set_xlim(-0.5, frac.shape[1] - 0.5)
     ax.set_ylim(0, 1)
-    ax.set_xlabel(f"soma (sorted by {names[0]} share)")
+    ax.set_xlabel(f"soma (sorted by {sort_by} share, descending)")
     ax.set_ylabel("share of |cable weight|")
     ax.set_title(f"Which nonlinearity each soma reads: {label}")
     ax.grid(False)
     ax.legend(loc="upper right", ncol=len(names), frameon=True, facecolor=SURFACE, edgecolor=GRID)
-    _finish(fig, path, "Each bar is one soma; the segments are the fraction of its absolute "
-                       "dendrite-to-soma weight on each channel (layer 0).")
+    _finish(fig, path, note)
 
 
 def main():
@@ -150,21 +174,38 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     for i, tag in enumerate(args.tags):
         model, r = load(tag)
-        bank = model.dend_act
-        print(f"{Path(tag).name}: test acc {100 * r['test_acc']:.2f}%  |  {bank}")
+        act = model.dend_act
+        branch = hasattr(act, "type_idx")
+        bank = act.bank if branch else act
+        print(f"{Path(tag).name}: test acc {100 * r['test_acc']:.2f}%  |  {act}")
         if i == 0:
             fig_curves(bank, out / "5_v1_nonlinearities.png")
-        if bank.n_channels == 1:
-            print(f"  single-channel run ({bank.channels[0]}-only): every soma reads only that "
+        if not branch and act.n_channels == 1:
+            print(f"  single-channel run ({act.channels[0]}-only): every soma reads only that "
                   "channel, so there is no channel usage to report")
         else:
+            D = r["dends"] * r["soma"]
+            groups = row_groups(act, D)
+            names = [g[0] for g in groups]
+            if branch:
+                print(f"  branch run: {dict(zip(names, act.counts))} dendrites of each type per "
+                      "soma; an unbiased soma would weight them in that proportion")
             for li, soma_layer in enumerate(model.soma_layers):
-                frac = channel_weight_fraction(soma_layer, r["dends"], r["soma"], bank.n_channels)
-                report_fractions(frac, bank.channels,
-                                 f"layer {li}: cable-weight share per channel")
+                frac = channel_weight_fraction(soma_layer, groups)
+                report_fractions(frac, names, f"layer {li}: cable-weight share per nonlinearity")
                 if i == 0 and li == 0:
-                    fig_usage(frac, bank.channels, out / "6_v1_channel_usage.png",
-                              f"{r['dends']} dends x {r['soma']} somata, seed {r['seed']}")
+                    label = f"{r['dends']} dends x {r['soma']} somata, seed {r['seed']}"
+                    if branch:
+                        label += f", mix {act.mix}"
+                        note = ("Each bar is one soma; the segments are the fraction of its "
+                                "absolute dendrite-to-soma weight on dendrites of each type "
+                                f"(layer 0). Dendrites per soma: {dict(zip(names, act.counts))}.")
+                    else:
+                        note = ("Each bar is one soma; the segments are the fraction of its "
+                                "absolute dendrite-to-soma weight on each channel (layer 0).")
+                    for ch in names:  # one figure per sort order
+                        fig_usage(frac, names, out / f"6_v1_channel_usage_by_{ch}.png", label,
+                                  ch, note)
         if args.data_dir:
             report_activity(model, r, args.data_dir)
 
