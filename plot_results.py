@@ -21,6 +21,14 @@ only by seed, and writes to figures/:
     8_ratio_sweep.png         per-dendrite ratio models (--nonlin branch --mix S:B:C) vs the
                               best single nonlinearity and V1 mixed at the same size
     ratio_sweep.csv           the numbers behind figure 8, with a verdict per ratio
+    9_constants_sweep.png     for models whose fixed constants were varied (--leak,
+                              --ca-thresh, ...): validation and test accuracy per variant
+    constants_sweep.csv       the numbers behind figure 9, ranked by validation accuracy,
+                              plus ready-to-paste sweep_constants.sh lines for the winners
+
+Runs that change a fixed constant are separate variants named <model>@<settings>, e.g.
+ca@thr0.5_leak0.1. --select chooses which variant of each model figures 7-8 and the control
+tables show: the default constants (default) or the best VALIDATION accuracy (best-val).
 
 Runs made with `base_model.py --nonlin ...` (tagged dann_<nonlin>_*) are grouped separately
 from the LeakyReLU baseline. Figures 2-3 draw the baseline and the V1 mixed model (same
@@ -77,16 +85,16 @@ DATASET_NAME = {"fmnist": "Fashion-MNIST", "cifar10": "CIFAR-10"}
 SAMPLING_NAME = {"local": "dANN-LRF", "global": "dANN-GRF", "random": "dANN-R"}
 SAMPLING_ORDER = ["local", "global", "random"]
 # Dendritic nonlinearity (base_model.py --nonlin). Result files that predate the flag are 'leaky'.
-NONLIN_ORDER = ["leaky", "supra", "sub", "ca", "v1"]
+NONLIN_ORDER = ["leaky", "supra", "sub", "ca", "v1", "gate"]
 NONLIN_NAME = {"leaky": "", "supra": " supra-only", "sub": " sub-only", "ca": " Ca-only",
-               "v1": " + V1 mixed"}  # suffix on the sampling name
+               "v1": " + V1 mixed", "gate": " + Ca gate"}  # suffix on the sampling name
 SINGLE_NONLINS = ["leaky", "supra", "sub", "ca"]  # the homogeneous-type controls (control 1)
 SWEEP_NONLINS = ["leaky", "v1"]  # what the size-sweep figures (2, 3) draw
 # In the sweep figures color follows the sampling type and the nonlinearity is encoded by
 # line style and marker. In the control figure color follows the nonlinearity instead.
 NONLIN_STYLE = {"leaky": dict(ls="-", marker="o"), "v1": dict(ls=(0, (2, 1.5)), marker="s"),
                 "supra": dict(ls=":", marker="^"), "sub": dict(ls="-.", marker="v"),
-                "ca": dict(ls=(0, (6, 2)), marker="D")}
+                "ca": dict(ls=(0, (6, 2)), marker="D"), "gate": dict(ls=(0, (1, 1)), marker="X")}
 
 # --nonlin branch runs are one model variant per ratio, keyed "branch:<supra:sub:ca>".
 BRANCH_PREFIX = "branch:"
@@ -94,19 +102,59 @@ BRANCH_STYLE = dict(ls=(0, (4, 1, 1, 1)), marker="P")
 BRANCH_RAMP = ["#6a3fd6", "#9b7ae6", "#43278f", "#c3b1f0", "#2d1a66", "#d9ccf7"]
 _BRANCH_VARIANTS = set()  # registered by group_runs so colors are stable across figures
 
+# Fixed constants of the biological nonlinearities (mirror of base_model.py: keep in sync).
+# A run with non-default constants is its own variant: "<base>@<suffix>", e.g. "ca@thr0.5_leak0.1"
+# or "gate@bsupra_leak0.1" (basal nonlinearity first). The base name is the part before "@".
+CONSTANT_DEFAULTS = dict(supra_p=2.0, sub_sat=1.0, ca_thresh=1.0, ca_gain=10.0, ca_amp=1.0,
+                         leak=0.0, apical_frac=0.25)
+CONSTANT_SHORT = dict(supra_p="p", sub_sat="sat", ca_thresh="thr", ca_gain="gain", ca_amp="amp",
+                      leak="leak", apical_frac="ap")
+
+
+def run_constants(r):
+    """The constants a run used, with defaults filled in for files that predate a flag."""
+    c = {k: (r.get(k) if r.get(k) is not None else d) for k, d in CONSTANT_DEFAULTS.items()}
+    c["basal_nonlin"] = r.get("basal_nonlin") or "leaky"
+    return c
+
+
+def constants_parts(consts, nonlin):
+    """['bsupra', 'thr0.5', 'leak0.1']: the non-default settings, in a fixed order."""
+    if nonlin == "leaky":
+        return []
+    parts = []
+    if nonlin == "gate" and consts.get("basal_nonlin", "leaky") != "leaky":
+        parts.append(f"b{consts['basal_nonlin']}")
+    for key, default in CONSTANT_DEFAULTS.items():
+        if key == "apical_frac" and nonlin != "gate":
+            continue
+        if float(consts.get(key, default)) != default:
+            parts.append(f"{CONSTANT_SHORT[key]}{float(consts[key]):g}")
+    return parts
+
+
+def base_of(n):
+    return n.split("@", 1)[0]
+
+
+def variant_suffix(n):
+    return n.split("@", 1)[1] if "@" in n else ""
+
 
 def is_branch(n):
-    return n.startswith(BRANCH_PREFIX)
+    return base_of(n).startswith(BRANCH_PREFIX)
 
 
 def branch_mix(n):
-    return n[len(BRANCH_PREFIX):]
+    return base_of(n)[len(BRANCH_PREFIX):]
 
 
 def variant_of(r):
-    """Model variant key for a run: the nonlin name, or 'branch:<mix>' for ratio runs."""
+    """Model variant key for a run: nonlin name (or 'branch:<mix>'), plus '@<non-default constants>'."""
     n = r.get("nonlin", "leaky")
-    return f"{BRANCH_PREFIX}{r['mix']}" if n == "branch" else n
+    base = f"{BRANCH_PREFIX}{r['mix']}" if n == "branch" else n
+    parts = constants_parts(run_constants(r), n)
+    return base + ("@" + "_".join(parts) if parts else "")
 
 
 def mix_sort_key(mix):
@@ -116,28 +164,37 @@ def mix_sort_key(mix):
 
 
 def nonlin_rank(n):
-    if n in NONLIN_ORDER:
-        return (NONLIN_ORDER.index(n), (0, 0, ""))
-    return (len(NONLIN_ORDER), mix_sort_key(branch_mix(n)))
+    b = base_of(n)
+    if b in NONLIN_ORDER:
+        return (NONLIN_ORDER.index(b), (0, 0, ""), variant_suffix(n))
+    return (len(NONLIN_ORDER), mix_sort_key(branch_mix(b)), variant_suffix(n))
+
+
+def _with_suffix(text, n):
+    s = variant_suffix(n)
+    return f"{text} [{s}]" if s else text
 
 
 def nonlin_suffix(n):
-    return NONLIN_NAME[n] if n in NONLIN_NAME else f" branch {branch_mix(n)}"
+    b = base_of(n)
+    return _with_suffix(NONLIN_NAME[b] if b in NONLIN_NAME else f" branch {branch_mix(b)}", n)
 
 
 def nonlin_label(n):
-    return NONLIN_LABEL[n] if n in NONLIN_LABEL else f"branch {branch_mix(n)}"
+    b = base_of(n)
+    return _with_suffix(NONLIN_LABEL[b] if b in NONLIN_LABEL else f"branch {branch_mix(b)}", n)
 
 
 def nonlin_style(n):
-    return NONLIN_STYLE.get(n, BRANCH_STYLE)
+    return NONLIN_STYLE.get(base_of(n), BRANCH_STYLE)
 
 
 def nonlin_color(n):
-    if n in NONLIN_COLOR:
-        return NONLIN_COLOR[n]
-    ranked = sorted(_BRANCH_VARIANTS | {n}, key=nonlin_rank)
-    return BRANCH_RAMP[ranked.index(n) % len(BRANCH_RAMP)]
+    b = base_of(n)
+    if b in NONLIN_COLOR:
+        return NONLIN_COLOR[b]
+    ranked = sorted(_BRANCH_VARIANTS | {b}, key=nonlin_rank)
+    return BRANCH_RAMP[ranked.index(b) % len(BRANCH_RAMP)]
 
 
 def model_name(sampling, nonlin):
@@ -161,7 +218,7 @@ AXIS = "#c3c2b7"
 COLOR = {"local": "#2a78d6", "global": "#eb6834", "random": "#1baf7a"}
 # Control figure: one color per nonlinearity (same channel colors as analyze_v1.py)
 NONLIN_COLOR = {"leaky": "#898781", "supra": "#eb6834", "sub": "#2a78d6", "ca": "#1baf7a",
-                "v1": "#0b0b0b"}
+                "v1": "#0b0b0b", "gate": "#0f8b8d"}
 TRAIN_VAL = {"train": "#2a78d6", "val": "#eb6834"}
 # Ordinal blue ramp for soma counts, light -> dark (light end still clears 2:1)
 SOMA_RAMP = ["#86b6ef", "#5598e7", "#2a78d6", "#1c5cab", "#104281"]
@@ -225,7 +282,7 @@ def config_key(r):
     """
     return (r["dataset"], r["sampling"], r["layers"], r["dends"], r["soma"],
             r["synapses"], r["lr"], r["batch_size"], r["epochs"], variant_of(r),
-            r.get("train_subset"))
+            r.get("train_subset"))  # variant_of already encodes every non-default constant
 
 
 def mean_sd(values):
@@ -243,20 +300,47 @@ def group_runs(runs):
     for key, rs in groups.items():
         dataset, sampling, layers, dends, soma, synapses, lr, bs, epochs, nonlin, subset = key
         if is_branch(nonlin):
-            _BRANCH_VARIANTS.add(nonlin)
+            _BRANCH_VARIANTS.add(base_of(nonlin))
         acc_m, acc_s = mean_sd([100 * r["test_acc"] for r in rs])
         loss_m, loss_s = mean_sd([r["test_loss"] for r in rs])
+        # final-epoch validation accuracy: the only number used to choose between variants
+        val_m, val_s = mean_sd([100 * r["val_acc"][-1] for r in rs])
         n_ep = min(len(r["train_loss"]) for r in rs)
         curves = {k: np.array([r[k][:n_ep] for r in rs], dtype=float)
                   for k in ("train_loss", "train_acc", "val_loss", "val_acc")}
         configs.append(dict(
             dataset=dataset, sampling=sampling, layers=layers, dends=dends, soma=soma,
             synapses=synapses, lr=lr, batch_size=bs, epochs=epochs, nonlin=nonlin,
-            train_subset=subset,
+            variant=nonlin, train_subset=subset, constants=run_constants(rs[0]),
             n_params=rs[0]["n_params"], n=len(rs), seeds=sorted(r["seed"] for r in rs),
             acc=acc_m, acc_sd=acc_s, loss=loss_m, loss_sd=loss_s, curves=curves,
+            val_acc=val_m, val_acc_sd=val_s,
         ))
     return configs
+
+
+def select_variants(configs, mode="default"):
+    """One config per (dataset, sampling, size, base model) for the comparison figures.
+
+    'default'  keeps the variant with default constants (tuned variants are left out).
+    'best-val' keeps the variant with the highest mean validation accuracy. Test accuracy is
+               never consulted, so the test numbers of the chosen variants stay honest.
+    Returned configs have `nonlin` set to the base name and `variant` to the full key.
+    """
+    groups = defaultdict(list)
+    for c in configs:
+        groups[(c["dataset"], c["sampling"], c["dends"], c["soma"], base_of(c["nonlin"]))].append(c)
+    chosen = []
+    for (ds, s, d, so, base), cs in groups.items():
+        if mode == "best-val":
+            pick = max(cs, key=lambda c: c["val_acc"])
+        else:
+            plain = [c for c in cs if c["nonlin"] == base]
+            if not plain:
+                continue
+            pick = plain[0]
+        chosen.append(dict(pick, nonlin=base, variant=pick["nonlin"]))
+    return chosen
 
 
 def paper_comparable(c):
@@ -548,7 +632,7 @@ def fig_learning_curves(best, out):
 # ---------------------------------------------------------------------------
 
 NONLIN_LABEL = {"leaky": "LeakyReLU (paper)", "supra": "supra-only", "sub": "sub-only",
-                "ca": "Ca-only", "v1": "V1 mixed"}
+                "ca": "Ca-only", "v1": "V1 mixed", "gate": "Ca gate (BAC)"}
 
 
 def fig_control_homogeneous(configs, datasets, out):
@@ -577,10 +661,11 @@ def fig_control_homogeneous(configs, datasets, out):
                 # error bars as well: with one size per model there is no band to shade
                 ax.errorbar(px, m, yerr=sd, fmt="none", ecolor=NONLIN_COLOR[n], elinewidth=1.2,
                             capsize=3, alpha=0.8, zorder=2)
+                line_label = nonlin_label(cs[0].get("variant", n))  # shows tuned constants
                 ax.plot(px, m, color=NONLIN_COLOR[n], marker=NONLIN_STYLE[n]["marker"],
-                        mec=SURFACE, mew=1.2, lw=2.6 if n == "v1" else 2, label=NONLIN_LABEL[n],
-                        zorder=3)
-                ends.append((px[-1], m[-1], NONLIN_LABEL[n]))
+                        mec=SURFACE, mew=1.2, lw=2.6 if n in ("v1", "gate") else 2,
+                        label=line_label, zorder=3)
+                ends.append((px[-1], m[-1], line_label))
             if ds in PAPER and s in PAPER[ds]:
                 ax.axhline(PAPER[ds][s][metric][0], color=MUTED, lw=1, ls=(0, (4, 3)),
                            label="Paper best (Table 1)")
@@ -596,9 +681,10 @@ def fig_control_homogeneous(configs, datasets, out):
                 ax.legend(loc="lower right")
     _finish(fig, out / "7_control_homogeneous.png",
             "Control 1 (homogeneous type): if any single-nonlinearity line matches the black "
-            "V1 mixed line, mixing adds nothing. Single-nonlinearity models have the baseline's "
-            "parameter count; V1 mixed has three cable weights per dendrite. Error bars and "
-            "shading: SD over seeds.")
+            "V1 mixed line, mixing adds nothing. Single-nonlinearity models and the Ca gate have "
+            "the baseline's parameter count; V1 mixed has three cable weights per dendrite. "
+            "Error bars and shading: SD over seeds. Constants in [brackets] were chosen on "
+            "validation accuracy.")
 
 
 def write_control_homogeneous(configs, out):
@@ -625,6 +711,15 @@ def write_control_homogeneous(configs, out):
             row[f"{n}_acc_sd"] = round(group[n]["acc_sd"], 3) if n in group else ""
         row.update(best_single=best_n, gap_pp=round(gap, 3), tolerance_pp=round(tol, 3),
                    verdict="mixed wins" if gap > tol else "single is enough")
+        if "gate" in group:  # the Ca gate is judged against the same best single nonlinearity
+            gg = group["gate"]
+            g_gap, g_tol = gg["acc"] - b["acc"], tolerance(gg["acc_sd"], b["acc_sd"])
+            row.update(gate_gap_pp=round(g_gap, 3), gate_tolerance_pp=round(g_tol, 3),
+                       gate_verdict="gate wins" if g_gap > g_tol else "no advantage")
+        else:
+            row.update(gate_gap_pp="", gate_tolerance_pp="", gate_verdict="")
+        row["variants"] = "; ".join(f"{n}={group[n].get('variant', n)}" for n in NONLIN_ORDER
+                                    if n in group and group[n].get("variant", n) != n)
         rows.append(row)
     if not rows:
         print("  skipping control1_homogeneous.csv: need v1 and single-nonlinearity runs "
@@ -646,10 +741,122 @@ def write_control_homogeneous(configs, out):
                         else f"{'-':>18s}" for n in NONLIN_ORDER)
         print(f"{r['dataset']:9s} {r['model']:9s} {r['size']:22s} {r['seeds']:>5d}{cells}  "
               f"{r['best_single']:>11s} {r['gap_pp']:+6.2f}  {r['verdict']}")
+        if r["gate_verdict"]:
+            print(f"{'':9s} {'':9s} {'':22s} {'':5s}{'Ca gate vs best single':>{18 * len(NONLIN_ORDER)}s}  "
+                  f"{'':>11s} {r['gate_gap_pp']:+6.2f}  {r['gate_verdict']}")
+        if r["variants"]:
+            print(f"{'':9s} tuned variants shown: {r['variants']}")
     if any(r["seeds"] < 3 for r in rows):
         print("  note: fewer than 3 seeds, so the SD and the verdict are unreliable; "
               "the tolerance floor of 0.5 pp is doing the work.")
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Constants sweep: variants of one model that differ only in the fixed constants
+# ---------------------------------------------------------------------------
+
+def _variants_by_base(configs):
+    """(dataset, sampling, dends, soma, base) -> [configs], only where a tuned variant exists."""
+    groups = defaultdict(list)
+    for c in configs:
+        groups[(c["dataset"], c["sampling"], c["dends"], c["soma"], base_of(c["nonlin"]))].append(c)
+    keep = {k: v for k, v in groups.items() if any(c["nonlin"] != k[4] for c in v)}
+    return sorted(keep.items(), key=lambda kv: (kv[0][0], SAMPLING_ORDER.index(kv[0][1]),
+                                                kv[0][3], kv[0][2], nonlin_rank(kv[0][4])))
+
+
+def grid_line(c):
+    """'ca|--ca-thresh 0.5 --leak 0.1': a sweep_constants.sh line that reproduces this variant."""
+    base = base_of(c["nonlin"])
+    head = f"branch --mix {branch_mix(base)}" if is_branch(base) else base
+    flags = []
+    k = c["constants"]
+    if base == "gate" and k.get("basal_nonlin", "leaky") != "leaky":
+        flags.append(f"--basal-nonlin {k['basal_nonlin']}")
+    for key, default in CONSTANT_DEFAULTS.items():
+        if key == "apical_frac" and base != "gate":
+            continue
+        if float(k.get(key, default)) != default:
+            flags.append(f"--{key.replace('_', '-')} {float(k[key]):g}")
+    return f"{head}|{' '.join(flags)}"
+
+
+def write_constants_sweep(configs, out):
+    """constants_sweep.csv: every variant of each tuned model, ranked by validation accuracy."""
+    rows, winners = [], []
+    for (ds, s, dends, soma, base), cs in _variants_by_base(configs):
+        ranked = sorted(cs, key=lambda c: -c["val_acc"])
+        winners.append(ranked[0])
+        for i, c in enumerate(ranked):
+            rows.append({"dataset": ds, "model": SAMPLING_NAME[s],
+                         "size": f"{dends} dends x {soma} somata", "base": nonlin_label(base),
+                         "variant": variant_suffix(c["nonlin"]) or "(defaults)", "seeds": c["n"],
+                         "val_acc": round(c["val_acc"], 3), "val_acc_sd": round(c["val_acc_sd"], 3),
+                         "test_acc": round(c["acc"], 3), "test_acc_sd": round(c["acc_sd"], 3),
+                         "selected": "yes" if i == 0 else "", "grid_line": grid_line(c)})
+    if not rows:
+        print("  skipping constants_sweep.csv: no runs with non-default constants")
+        return rows
+    path = out / "constants_sweep.csv"
+    with path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    print(f"  wrote {path}")
+
+    print("\nConstants sweep: variants ranked by VALIDATION accuracy (%), test shown for reference")
+    print(f"{'dataset':9s} {'size':22s} {'model':20s} {'variant':26s} {'seeds':>5s}  "
+          f"{'val acc':>14s}  {'test acc':>14s}  pick")
+    for r in rows:
+        print(f"{r['dataset']:9s} {r['size']:22s} {r['base']:20s} {r['variant']:26s} "
+              f"{r['seeds']:>5d}  {r['val_acc']:6.2f} +/- {r['val_acc_sd']:4.2f}  "
+              f"{r['test_acc']:6.2f} +/- {r['test_acc_sd']:4.2f}  {'<-' if r['selected'] else ''}")
+    if any(r["seeds"] < 2 for r in rows):
+        print("  note: single-seed variants; differences under ~1 pp are noise. Rerun the "
+              "winners with more seeds (stage 2) before drawing conclusions.")
+    print("\nStage-2 grid lines (winners), for sweep_constants.sh via GRID=<file>:")
+    for c in winners:
+        print(f"  {grid_line(c)}")
+    return rows
+
+
+def fig_constants_sweep(configs, datasets, out):
+    """Validation accuracy per variant for each tuned model, one panel per model and size."""
+    panels = [(k, cs) for k, cs in _variants_by_base(configs) if k[0] in datasets]
+    if not panels:
+        print("  skipping 9_constants_sweep.png: no runs with non-default constants")
+        return
+    ncol = 2 if len(panels) > 1 else 1
+    nrow = math.ceil(len(panels) / ncol)
+    fig, axes = plt.subplots(nrow, ncol, figsize=(5.2 * ncol, 3.4 * nrow), squeeze=False)
+    for ax in axes.flat[len(panels):]:
+        ax.set_visible(False)
+    for ax, ((ds, s, dends, soma, base), cs) in zip(axes.flat, panels):
+        cs = sorted(cs, key=lambda c: nonlin_rank(c["nonlin"]))
+        x = np.arange(len(cs))
+        color = nonlin_color(base)
+        val = np.array([c["val_acc"] for c in cs]); vsd = np.array([c["val_acc_sd"] for c in cs])
+        test = np.array([c["acc"] for c in cs])
+        ax.errorbar(x, val, yerr=vsd, fmt="o", ms=7, mfc=color, mec=SURFACE, mew=1.2,
+                    ecolor=color, elinewidth=1.3, capsize=3, label="validation", zorder=4)
+        ax.plot(x, test, "o", ms=7, mfc="none", mec=color, mew=1.3, label="test", zorder=3)
+        best = int(np.argmax(val))
+        ax.annotate("selected", (x[best], val[best]), xytext=(0, 9), textcoords="offset points",
+                    ha="center", fontsize=8, color=INK_2)
+        ax.set_xticks(x)
+        ax.set_xticklabels([variant_suffix(c["nonlin"]) or "defaults" for c in cs],
+                           rotation=30, ha="right", fontsize=8)
+        ax.set_xlim(-0.6, len(cs) - 0.4)
+        ax.margins(y=0.3)
+        ax.grid(axis="x", visible=False)
+        ax.set_ylabel("Accuracy (%)")
+        ax.set_title(f"{DATASET_NAME.get(ds, ds)}, {nonlin_label(base)}, {dends} x {soma}")
+    axes.flat[0].legend(loc="lower right")
+    _finish(fig, out / "9_constants_sweep.png",
+            "Each panel is one model whose fixed constants were varied; x labels are the "
+            "non-default settings. Filled: validation accuracy (used to select), hollow: test. "
+            "Error bars: SD over seeds (none for single-seed runs).")
 
 
 # ---------------------------------------------------------------------------
@@ -807,12 +1014,13 @@ def write_summary(best, n_configs, out):
 
 def print_summary(rows):
     print("\nBest model vs paper Table 1 (test accuracy, %)")
-    print(f"{'dataset':9s} {'model':24s} {'best size':22s} {'seeds':>5s}  "
+    w = max(24, max(len(r["model"]) for r in rows)) if rows else 24
+    print(f"{'dataset':9s} {'model':{w}s} {'best size':22s} {'seeds':>5s}  "
           f"{'yours':>14s}  {'paper':>14s}  {'diff':>6s}  verdict")
     for r in rows:
         yours = f"{r['your_acc']:.2f} +/- {r['your_acc_sd']:.2f}"
         paper = f"{r['paper_acc']:.2f} +/- {r['paper_acc_sd']:.2f}"
-        print(f"{r['dataset']:9s} {r['model']:24s} {r['best_size']:22s} {r['seeds']:>5d}  "
+        print(f"{r['dataset']:9s} {r['model']:{w}s} {r['best_size']:22s} {r['seeds']:>5d}  "
               f"{yours:>14s}  {paper:>14s}  {r['diff_pp']:+6.2f}  {r['verdict']}")
     notes = []
     if any(r["seeds"] < 5 for r in rows):
@@ -839,6 +1047,10 @@ def main():
     p.add_argument("--results", default="results", help="folder with the .json results")
     p.add_argument("--out", default="figures", help="folder to write figures into")
     p.add_argument("--dataset", default=None, choices=["fmnist", "cifar10"])
+    p.add_argument("--select", default="default", choices=["default", "best-val"],
+                   help="which variant of each model the comparison figures (7, 8) and control "
+                        "tables use when constants were tuned: the default constants, or the "
+                        "variant with the best VALIDATION accuracy")
     args = p.parse_args()
 
     runs = load_runs(args.results, args.dataset)
@@ -861,15 +1073,21 @@ def main():
     for c in comparable:
         n_configs[(c["dataset"], c["sampling"], c["nonlin"])] += 1
 
+    # Comparison figures and tables see one variant per model (constants chosen by --select)
+    selected = select_variants(comparable, args.select)
+    print(f"Variant selection for figures 7-8 and the control tables: {args.select}")
+
     fig_paper_comparison(best, datasets, out)
     fig_size_sweep(comparable, datasets, out)
     fig_dendrites_per_soma(comparable, datasets, out)
     fig_learning_curves(best, out)
-    fig_control_homogeneous(comparable, datasets, out)
-    fig_ratio_sweep(comparable, datasets, out)
+    fig_control_homogeneous(selected, datasets, out)
+    fig_ratio_sweep(selected, datasets, out)
+    fig_constants_sweep(comparable, datasets, out)
     print_summary(write_summary(best, n_configs, out))
-    write_control_homogeneous(comparable, out)
-    write_ratio_sweep(comparable, out)
+    write_control_homogeneous(selected, out)
+    write_ratio_sweep(selected, out)
+    write_constants_sweep(comparable, out)
 
 
 if __name__ == "__main__":

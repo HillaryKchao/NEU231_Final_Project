@@ -17,11 +17,16 @@ reports the scale of the dendritic pre-activations u, the fraction above the Ca 
 and each nonlinearity's share of the actual drive to the somata (mean |w * f(u)| over the
 batch), which accounts for the channels' different output scales.
 
+For `--nonlin gate` runs it reports instead how the apical Ca plateau gates the basal drive:
+apical vs basal weight share, how often the gate is open, the mean amplification, and the
+correlation between basal drive and gate (coincidence).
+
 Figures (for the first tag):
     5_v1_nonlinearities.png   the f_k(u) curves of that run's channels, with its constants
     6_v1_channel_usage_by_{supra,sub,ca}.png
                               per-soma stacked bars of the cable-weight fractions (v1 and
                               branch runs), somata sorted by that channel's share
+    10_gate_activity.png      gate runs: histogram of gate values, basal drive vs gate
 """
 import argparse
 import json
@@ -30,13 +35,12 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from base_model import DendriticANN, load_data
-from plot_results import COLOR, GRID, INK_2, MUTED, SURFACE, _finish, plt
+from base_model import CONSTANT_DEFAULTS, DendriticANN, load_data
+from plot_results import COLOR, GRID, INK_2, MUTED, NONLIN_COLOR, SURFACE, _finish, plt
 
 IMG = {"fmnist": ((28, 28), 1), "cifar10": ((32, 32), 3)}
 CHANNEL_COLOR = {"supra": COLOR["global"], "sub": COLOR["local"], "ca": COLOR["random"]}
-NONLIN_KEYS = ("supra_p", "sub_sat", "ca_thresh", "ca_gain", "ca_amp")
-BANK_NONLINS = ("v1", "supra", "sub", "ca", "branch")
+BANK_NONLINS = ("v1", "supra", "sub", "ca", "branch", "gate")
 
 
 def load(tag):
@@ -47,13 +51,63 @@ def load(tag):
     if nonlin not in BANK_NONLINS:
         raise SystemExit(f"{tag.name} is a {nonlin} run; this script needs one of {BANK_NONLINS}")
     img_shape, channels = IMG[r["dataset"]]
+    consts = {k: (r.get(k) if r.get(k) is not None else d) for k, d in CONSTANT_DEFAULTS.items()}
+    apical_frac = consts.pop("apical_frac")
     model = DendriticANN(img_shape, channels, 10, dends=r["dends"], soma=r["soma"],
                          synapses=r["synapses"], layers=r["layers"], sampling=r["sampling"],
                          seed=r["seed"], nonlin=nonlin, mix=r.get("mix", "1:1:1"),
-                         nonlin_params={k: r[k] for k in NONLIN_KEYS})
+                         nonlin_params=consts, basal_nonlin=r.get("basal_nonlin") or "leaky",
+                         apical_frac=apical_frac)
     model.load_state_dict(torch.load(tag.with_suffix(".pt"), map_location="cpu"))
     model.eval()
     return model, r
+
+
+@torch.no_grad()
+def report_gate(model, r, data_dir, out, n=2048, make_fig=True):
+    """Ca-gate runs: how much the apical plateau actually gates the basal drive."""
+    g0 = model.soma_layers[0]
+    wb = (g0.basal.weight * g0.basal.mask).abs().sum(0)
+    wa = (g0.apical.weight * g0.apical.mask).abs().sum(0)
+    share = wa / (wa + wb).clamp_min(1e-12)
+    print(f"  gate model: {g0.n_basal} basal + {g0.n_apical} apical dendrites per soma; apical "
+          f"share of |cable weight| mean {share.mean():.3f} (min {share.min():.3f}, max {share.max():.3f})"
+          f" vs {g0.n_apical / (g0.n_basal + g0.n_apical):.3f} by count")
+    if not data_dir:
+        print("  (pass --data-dir to measure gate activity on validation images)")
+        return
+    data, *_ = load_data(r["dataset"], data_dir, seed=r["seed"])
+    x = torch.as_tensor(data["val"][0][:n])
+    h = model.dend_act(model.dend_layers[0](x))
+    basal = g0.basal(h)
+    g0(h)  # sets last_gate
+    gate = g0.last_gate                                   # (n, soma) in [0, 1]
+    corr = torch.corrcoef(torch.stack([basal.flatten(), gate.flatten()]))[0, 1]
+    print(f"  gate activity on {n} validation images (layer 0):")
+    print(f"    Ca gate: mean {gate.mean():.3f}; frac of (image, soma) above 0.5 {(gate > 0.5).float().mean():.3f}; "
+          f"frac of somata with mean gate > 0.5 {(gate.mean(0) > 0.5).float().mean():.3f}")
+    print(f"    amplification (1 + g*Ca): mean {(1 + g0.ca_amp * gate).mean():.3f}; "
+          f"corr(basal drive, gate) {corr:.3f}")
+    if (gate > 0.5).float().mean() < 1e-3:
+        print("    note: the gate almost never opens; try a lower --ca-thresh")
+    if (gate > 0.5).float().mean() > 0.999:
+        print("    note: the gate is always open, so it acts as a constant gain; try a higher --ca-thresh")
+    if make_fig:
+        fig, axes = plt.subplots(1, 2, figsize=(9, 3.4))
+        axes[0].hist(gate.flatten().numpy(), bins=50, color=NONLIN_COLOR["gate"], lw=0)
+        axes[0].set_xlabel("Ca gate value (per image, per soma)")
+        axes[0].set_ylabel("count")
+        axes[0].set_title("How open the apical gate is")
+        idx = torch.randperm(basal.numel(), generator=torch.Generator().manual_seed(0))[:4000]
+        axes[1].scatter(basal.flatten()[idx].numpy(), gate.flatten()[idx].numpy(), s=5, alpha=0.35,
+                        color=NONLIN_COLOR["gate"], lw=0)
+        axes[1].set_xlabel("basal drive B")
+        axes[1].set_ylabel("Ca gate")
+        axes[1].set_title(f"Coincidence: basal drive vs gate (r = {corr:.2f})")
+        _finish(fig, out / "10_gate_activity.png",
+                "Left: distribution of the apical Ca plateau over validation images and somata. "
+                "Right: the gate only matters where basal drive is large; a positive correlation "
+                "means apical and basal inputs tend to agree.")
 
 
 def row_groups(act, D):
@@ -178,6 +232,12 @@ def main():
         branch = hasattr(act, "type_idx")
         bank = act.bank if branch else act
         print(f"{Path(tag).name}: test acc {100 * r['test_acc']:.2f}%  |  {act}")
+        if model.nonlin == "gate":
+            print(f"  {model.soma_layers[0]}")
+            report_gate(model, r, args.data_dir, out, make_fig=(i == 0))
+            if hasattr(bank, "channels") and i == 0:
+                fig_curves(bank, out / "5_v1_nonlinearities.png")
+            continue
         if i == 0:
             fig_curves(bank, out / "5_v1_nonlinearities.png")
         if not branch and act.n_channels == 1:

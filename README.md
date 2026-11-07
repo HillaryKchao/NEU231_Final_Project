@@ -52,6 +52,41 @@ python plot_results.py                       # figures/8_ratio_sweep.png + ratio
 Figure 8 shows each ratio with error bars against the best single nonlinearity and the V1
 mixed model at the same size; the CSV adds a "ratio wins" / "no advantage" verdict.
 
+## Tuning the biological nonlinearities
+
+The fixed constants (Ca threshold, gain, exponent, saturation) were initial guesses, and the
+single-nonlinearity controls lose about a point to LeakyReLU on CIFAR-10 partly because the
+fixed functions clip: Ca is bounded and flat away from threshold, tanh saturates, relu^p is
+zero for negative input. Two remedies:
+
+- `--leak L` adds a passive component to every channel, `f(u) + L*u` (real dendrites conduct
+  passively alongside any active mechanism; 0.1 is the slope LeakyReLU keeps). Default 0.
+- `sweep_constants.sh` runs a grid over the constants (and the Ca gate below) with one seed.
+  `python plot_results.py --select best-val` ranks the variants by **validation** accuracy,
+  never test, prints the winners as grid lines, and uses them in the comparison figures. Rerun
+  the winners with `SEEDS="2 3" GRID=<file>` before drawing conclusions.
+
+Runs with non-default constants get a tag suffix (`..._thr0.5_leak0.1_seed1`) and appear in
+the figures as `model [thr0.5_leak0.1]`. `9_constants_sweep.png` / `constants_sweep.csv` show
+every variant.
+
+## Ca gate model (`--nonlin gate`)
+
+The Ca spike's job in a pyramidal cell is not to add to the somatic input but to detect
+coincidence between apical and basal drive and turn a spike into a burst. The gate model gives
+each soma that computation, which no weighted sum of fixed functions can express:
+
+    B  = basal dendrites' drive        (12 of 16 dendrites, LeakyReLU by default)
+    A  = apical dendrites' drive        (4 of 16)
+    Ca = sigmoid(k (A - theta))         apical plateau in [0, 1]
+    soma = LeakyReLU( B * (1 + g Ca) )  apical gates basal
+
+Flags: `--apical-frac` (0.25), `--basal-nonlin {leaky,supra,sub,ca}` (leaky, so a win is
+attributable to the gate), `--ca-thresh`, `--ca-gain`, `--ca-amp`. Masked weights equal the
+baseline's; there is one extra bias vector. `analyze_v1.py` reports how often the gate opens
+and the correlation between basal drive and gate (`10_gate_activity.png`). Note that theta is
+applied to the learned apical sum, so the apical bias can shift the effective threshold.
+
 ## CIFAR-10 on Colab
 
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/HillaryKchao/NEU231_Final_Project/blob/v1-nonlinearities/colab_cifar10.ipynb)
