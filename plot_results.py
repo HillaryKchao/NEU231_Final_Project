@@ -18,6 +18,9 @@ only by seed, and writes to figures/:
                               (LeakyReLU, supra-only, sub-only, Ca-only) vs model size
     control1_homogeneous.csv  at each size, V1 mixed vs the best single nonlinearity, with
                               a verdict ("mixed wins" / "single is enough")
+    8_ratio_sweep.png         per-dendrite ratio models (--nonlin branch --mix S:B:C) vs the
+                              best single nonlinearity and V1 mixed at the same size
+    ratio_sweep.csv           the numbers behind figure 8, with a verdict per ratio
 
 Runs made with `base_model.py --nonlin ...` (tagged dann_<nonlin>_*) are grouped separately
 from the LeakyReLU baseline. Figures 2-3 draw the baseline and the V1 mixed model (same
@@ -85,9 +88,60 @@ NONLIN_STYLE = {"leaky": dict(ls="-", marker="o"), "v1": dict(ls=(0, (2, 1.5)), 
                 "supra": dict(ls=":", marker="^"), "sub": dict(ls="-.", marker="v"),
                 "ca": dict(ls=(0, (6, 2)), marker="D")}
 
+# --nonlin branch runs are one model variant per ratio, keyed "branch:<supra:sub:ca>".
+BRANCH_PREFIX = "branch:"
+BRANCH_STYLE = dict(ls=(0, (4, 1, 1, 1)), marker="P")
+BRANCH_RAMP = ["#6a3fd6", "#9b7ae6", "#43278f", "#c3b1f0", "#2d1a66", "#d9ccf7"]
+_BRANCH_VARIANTS = set()  # registered by group_runs so colors are stable across figures
+
+
+def is_branch(n):
+    return n.startswith(BRANCH_PREFIX)
+
+
+def branch_mix(n):
+    return n[len(BRANCH_PREFIX):]
+
+
+def variant_of(r):
+    """Model variant key for a run: the nonlin name, or 'branch:<mix>' for ratio runs."""
+    n = r.get("nonlin", "leaky")
+    return f"{BRANCH_PREFIX}{r['mix']}" if n == "branch" else n
+
+
+def mix_sort_key(mix):
+    """Order ratios by their Ca share (12:3:1 before 1:1:1 before 1:3:12)."""
+    parts = [float(p) for p in mix.split(":")]
+    return (parts[2] / sum(parts), parts[1] / sum(parts), mix)
+
+
+def nonlin_rank(n):
+    if n in NONLIN_ORDER:
+        return (NONLIN_ORDER.index(n), (0, 0, ""))
+    return (len(NONLIN_ORDER), mix_sort_key(branch_mix(n)))
+
+
+def nonlin_suffix(n):
+    return NONLIN_NAME[n] if n in NONLIN_NAME else f" branch {branch_mix(n)}"
+
+
+def nonlin_label(n):
+    return NONLIN_LABEL[n] if n in NONLIN_LABEL else f"branch {branch_mix(n)}"
+
+
+def nonlin_style(n):
+    return NONLIN_STYLE.get(n, BRANCH_STYLE)
+
+
+def nonlin_color(n):
+    if n in NONLIN_COLOR:
+        return NONLIN_COLOR[n]
+    ranked = sorted(_BRANCH_VARIANTS | {n}, key=nonlin_rank)
+    return BRANCH_RAMP[ranked.index(n) % len(BRANCH_RAMP)]
+
 
 def model_name(sampling, nonlin):
-    return SAMPLING_NAME[sampling] + NONLIN_NAME[nonlin]
+    return SAMPLING_NAME[sampling] + nonlin_suffix(nonlin)
 
 # Settings the paper used; runs with anything else are left out of the comparison.
 PAPER_SETTINGS = {"layers": 1, "synapses": 16, "lr": 0.001, "batch_size": 128}
@@ -169,7 +223,7 @@ def config_key(r):
     Old result files predate --nonlin; they are the LeakyReLU baseline.
     """
     return (r["dataset"], r["sampling"], r["layers"], r["dends"], r["soma"],
-            r["synapses"], r["lr"], r["batch_size"], r["epochs"], r.get("nonlin", "leaky"))
+            r["synapses"], r["lr"], r["batch_size"], r["epochs"], variant_of(r))
 
 
 def mean_sd(values):
@@ -186,6 +240,8 @@ def group_runs(runs):
     configs = []
     for key, rs in groups.items():
         dataset, sampling, layers, dends, soma, synapses, lr, bs, epochs, nonlin = key
+        if is_branch(nonlin):
+            _BRANCH_VARIANTS.add(nonlin)
         acc_m, acc_s = mean_sd([100 * r["test_acc"] for r in rs])
         loss_m, loss_s = mean_sd([r["test_loss"] for r in rs])
         n_ep = min(len(r["train_loss"]) for r in rs)
@@ -218,12 +274,16 @@ def size_label(c):
     return f"{c['dends']} dends x {c['soma']} somata"
 
 
+def tolerance(sd_a, sd_b):
+    """Two combined SDs, but never tighter than 0.5 percentage points."""
+    return max(2 * math.sqrt(sd_a ** 2 + sd_b ** 2), 0.5)
+
+
 def verdict(c, paper):
     """Is the gap from the paper's mean within run-to-run noise?"""
     p_mean, p_sd = paper["acc"]
     diff = c["acc"] - p_mean
-    # Two combined SDs, but never tighter than 0.5 percentage points
-    tol = max(2 * math.sqrt(c["acc_sd"] ** 2 + p_sd ** 2), 0.5)
+    tol = tolerance(c["acc_sd"], p_sd)
     if abs(diff) <= tol:
         return diff, tol, "matches paper"
     return diff, tol, "higher than paper" if diff > 0 else "lower than paper"
@@ -440,8 +500,7 @@ def fig_dendrites_per_soma(configs, datasets, out):
 
 def fig_learning_curves(best, out):
     """Train vs validation curves for the best model per (dataset, sampling)."""
-    keys = sorted(best, key=lambda k: (k[0], SAMPLING_ORDER.index(k[1]),
-                                       NONLIN_ORDER.index(k[2])))
+    keys = sorted(best, key=lambda k: (k[0], SAMPLING_ORDER.index(k[1]), nonlin_rank(k[2])))
     fig, axes = plt.subplots(len(keys), 2, figsize=(10, 3.2 * len(keys)), squeeze=False)
     for row, k in enumerate(keys):
         c = best[k]
@@ -555,8 +614,7 @@ def write_control_homogeneous(configs, out):
         best_n = max(singles, key=lambda n: group[n]["acc"])
         b = group[best_n]
         gap = v["acc"] - b["acc"]
-        # Same rule as verdict(): two combined SDs, never tighter than 0.5 percentage points
-        tol = max(2 * math.sqrt(v["acc_sd"] ** 2 + b["acc_sd"] ** 2), 0.5)
+        tol = tolerance(v["acc_sd"], b["acc_sd"])
         row = {"dataset": ds, "model": SAMPLING_NAME[s], "size": f"{dends} dends x {soma} somata",
                "seeds": min(c["n"] for c in group.values())}
         for n in NONLIN_ORDER:
@@ -592,12 +650,132 @@ def write_control_homogeneous(configs, out):
 
 
 # ---------------------------------------------------------------------------
+# Ratio experiment: per-dendrite nonlinearity mixes (--nonlin branch --mix S:B:C)
+# ---------------------------------------------------------------------------
+
+def _size_groups(configs):
+    """(dataset, sampling, dends, soma) -> {variant: config}, sorted."""
+    groups = defaultdict(dict)
+    for c in configs:
+        groups[(c["dataset"], c["sampling"], c["dends"], c["soma"])][c["nonlin"]] = c
+    return sorted(groups.items(), key=lambda kv: (kv[0][0], SAMPLING_ORDER.index(kv[0][1]),
+                                                  kv[0][3], kv[0][2]))
+
+
+def _ratio_references(group):
+    """Reference models at one size: the best single nonlinearity and V1 mixed, if present."""
+    refs = []
+    singles = [n for n in SINGLE_NONLINS if n in group]
+    if singles:
+        best = max(singles, key=lambda n: group[n]["acc"])
+        refs.append((best, f"best single ({nonlin_label(best)})", NONLIN_COLOR[best], "-"))
+    if "v1" in group:
+        refs.append(("v1", NONLIN_LABEL["v1"], NONLIN_COLOR["v1"], (0, (2, 1.5))))
+    return refs
+
+
+def fig_ratio_sweep(configs, datasets, out):
+    """Per-dendrite ratio models vs the best single nonlinearity and V1 mixed, per size."""
+    panels = [(key, g) for key, g in _size_groups(configs)
+              if key[0] in datasets and any(is_branch(n) for n in g)]
+    if not panels:
+        print("  skipping 8_ratio_sweep.png: no --nonlin branch runs")
+        return
+    fig, axes = plt.subplots(len(panels), 2, figsize=(10, 3.8 * len(panels)), squeeze=False)
+    for row, ((ds, s, dends, soma), g) in enumerate(panels):
+        mixes = sorted((n for n in g if is_branch(n)), key=nonlin_rank)
+        for col, (metric, label) in enumerate([("acc", "Test accuracy (%)"),
+                                               ("loss", "Test loss")]):
+            ax = axes[row, col]
+            for n, name, color, ls in _ratio_references(g):
+                c = g[n]
+                m, sd = c[metric], c[f"{metric}_sd"]
+                ax.axhspan(m - sd, m + sd, color=color, alpha=0.08, lw=0)
+                ax.axhline(m, color=color, lw=1.3, ls=ls, label=name)
+            fmt = "{:.2f}" if metric == "acc" else "{:.3f}"
+            for i, n in enumerate(mixes):
+                c = g[n]
+                ax.errorbar(i, c[metric], yerr=c[f"{metric}_sd"], fmt=BRANCH_STYLE["marker"],
+                            ms=9, mfc=nonlin_color(n), mec=SURFACE, mew=1.2,
+                            ecolor=nonlin_color(n), elinewidth=1.4, capsize=4, zorder=4)
+                ax.annotate(fmt.format(c[metric]), (i, c[metric]), xytext=(10, 0),
+                            textcoords="offset points", va="center", fontsize=9, color=INK)
+            ax.set_xticks(np.arange(len(mixes)))
+            ax.set_xticklabels([branch_mix(n) for n in mixes])
+            ax.set_xlim(-0.6, len(mixes) - 0.4)
+            ax.set_xlabel("supra : sub : Ca dendrites per soma")
+            ax.set_ylabel(label)
+            ax.grid(axis="x", visible=False)
+            ax.margins(y=0.3)
+            ax.set_title(f"{DATASET_NAME.get(ds, ds)}, {SAMPLING_NAME[s]}, {dends} x {soma}: "
+                         f"ratio sweep, test {'accuracy' if metric == 'acc' else 'loss'}")
+            if row == 0 and col == 0 and ax.get_legend_handles_labels()[0]:
+                ax.legend(loc="lower left")
+    _finish(fig, out / "8_ratio_sweep.png",
+            "Each point is one per-dendrite ratio (every dendrite computes one nonlinearity; the "
+            "ratio sets how many of a soma's dendrites are supra, sub and Ca). Lines and bands: "
+            "the best single-nonlinearity model and the V1 mixed model at the same size, mean "
+            "and SD over seeds. Ratio models have the baseline parameter count.")
+
+
+def write_ratio_sweep(configs, out):
+    """ratio_sweep.csv: each ratio vs the best single nonlinearity and V1 mixed at its size."""
+    rows = []
+    for (ds, s, dends, soma), g in _size_groups(configs):
+        mixes = sorted((n for n in g if is_branch(n)), key=nonlin_rank)
+        if not mixes:
+            continue
+        singles = [n for n in SINGLE_NONLINS if n in g]
+        best = max(singles, key=lambda n: g[n]["acc"]) if singles else None
+        for n in mixes:
+            c = g[n]
+            row = {"dataset": ds, "model": SAMPLING_NAME[s], "size": f"{dends} dends x {soma} somata",
+                   "mix": branch_mix(n), "seeds": c["n"], "acc": round(c["acc"], 3),
+                   "acc_sd": round(c["acc_sd"], 3), "loss": round(c["loss"], 4),
+                   "best_single": best or "", "best_single_acc": "", "gap_vs_best_single_pp": "",
+                   "v1_acc": "", "gap_vs_v1_pp": "", "tolerance_pp": "", "verdict": ""}
+            if best:
+                b = g[best]
+                gap, tol = c["acc"] - b["acc"], tolerance(c["acc_sd"], b["acc_sd"])
+                row.update(best_single_acc=round(b["acc"], 3), gap_vs_best_single_pp=round(gap, 3),
+                           tolerance_pp=round(tol, 3),
+                           verdict="ratio wins" if gap > tol else "no advantage")
+            if "v1" in g:
+                row.update(v1_acc=round(g["v1"]["acc"], 3),
+                           gap_vs_v1_pp=round(c["acc"] - g["v1"]["acc"], 3))
+            rows.append(row)
+    if not rows:
+        print("  skipping ratio_sweep.csv: no --nonlin branch runs")
+        return rows
+    path = out / "ratio_sweep.csv"
+    with path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    print(f"  wrote {path}")
+
+    print("\nRatio experiment: per-dendrite supra:sub:Ca mixes, test accuracy (%)")
+    print(f"{'dataset':9s} {'model':9s} {'size':22s} {'mix':>8s} {'seeds':>5s}  {'acc':>14s}  "
+          f"{'best single':>22s}  {'vs best':>7s}  {'vs V1':>7s}  verdict")
+    for r in rows:
+        acc = f"{r['acc']:.2f} +/- {r['acc_sd']:.2f}"
+        bs = f"{r['best_single']} {r['best_single_acc']:.2f}" if r["best_single"] else "-"
+        vb = f"{r['gap_vs_best_single_pp']:+.2f}" if r["best_single"] else "-"
+        vv = f"{r['gap_vs_v1_pp']:+.2f}" if r["v1_acc"] != "" else "-"
+        print(f"{r['dataset']:9s} {r['model']:9s} {r['size']:22s} {r['mix']:>8s} {r['seeds']:>5d}  "
+              f"{acc:>14s}  {bs:>22s}  {vb:>7s}  {vv:>7s}  {r['verdict']}")
+    if any(r["seeds"] < 3 for r in rows):
+        print("  note: fewer than 3 seeds, so the SD and the verdict are unreliable.")
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # Summary table
 # ---------------------------------------------------------------------------
 
 def write_summary(best, n_configs, out):
     rows = []
-    order = lambda kv: (kv[0][0], SAMPLING_ORDER.index(kv[0][1]), NONLIN_ORDER.index(kv[0][2]))
+    order = lambda kv: (kv[0][0], SAMPLING_ORDER.index(kv[0][1]), nonlin_rank(kv[0][2]))
     for (ds, s, n), c in sorted(best.items(), key=order):
         if ds not in PAPER or s not in PAPER[ds]:
             continue
@@ -626,12 +804,12 @@ def write_summary(best, n_configs, out):
 
 def print_summary(rows):
     print("\nBest model vs paper Table 1 (test accuracy, %)")
-    print(f"{'dataset':9s} {'model':20s} {'best size':22s} {'seeds':>5s}  "
+    print(f"{'dataset':9s} {'model':24s} {'best size':22s} {'seeds':>5s}  "
           f"{'yours':>14s}  {'paper':>14s}  {'diff':>6s}  verdict")
     for r in rows:
         yours = f"{r['your_acc']:.2f} +/- {r['your_acc_sd']:.2f}"
         paper = f"{r['paper_acc']:.2f} +/- {r['paper_acc_sd']:.2f}"
-        print(f"{r['dataset']:9s} {r['model']:20s} {r['best_size']:22s} {r['seeds']:>5d}  "
+        print(f"{r['dataset']:9s} {r['model']:24s} {r['best_size']:22s} {r['seeds']:>5d}  "
               f"{yours:>14s}  {paper:>14s}  {r['diff_pp']:+6.2f}  {r['verdict']}")
     notes = []
     if any(r["seeds"] < 5 for r in rows):
@@ -685,8 +863,10 @@ def main():
     fig_dendrites_per_soma(comparable, datasets, out)
     fig_learning_curves(best, out)
     fig_control_homogeneous(comparable, datasets, out)
+    fig_ratio_sweep(comparable, datasets, out)
     print_summary(write_summary(best, n_configs, out))
     write_control_homogeneous(comparable, out)
+    write_ratio_sweep(comparable, out)
 
 
 if __name__ == "__main__":

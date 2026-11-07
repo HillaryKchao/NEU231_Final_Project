@@ -34,3 +34,20 @@ python plot_results.py                      # figures/7_control_homogeneous.png 
 
 The CSV compares the mixed model with the best single nonlinearity at each size and gives a
 verdict: "mixed wins" if the gap exceeds two combined SDs (and 0.5 pp), else "single is enough".
+
+### Ratio experiment: one nonlinearity per dendrite
+
+`--nonlin branch --mix S:B:C` gives every dendrite a single nonlinearity, with the ratio
+setting how many of each soma's dendrites are supra, sub and Ca (12:3:1 at 16 dendrites is
+exactly 12, 3 and 1). The cable layer and parameter count are the baseline's, so this tests
+mixing across branches without the extra cable weights of `v1`.
+
+Default ratios: `12:3:1` (biological: pyramidal dendrites are mostly NMDA-spike branches,
+sublinear integration is a minority regime, and the Ca spike is one apical site per cell),
+`1:1:1` (uniform), `1:3:12` (Ca-heavy counterfactual).
+
+NONLINS=branch bash sweep_controls.sh        # the three ratios, seeds 1-3 at 16x256 (~25 min on MPS)
+python plot_results.py                       # figures/8_ratio_sweep.png + ratio_sweep.csv
+
+Figure 8 shows each ratio with error bars against the best single nonlinearity and the V1
+mixed model at the same size; the CSV adds a "ratio wins" / "no advantage" verdict.
