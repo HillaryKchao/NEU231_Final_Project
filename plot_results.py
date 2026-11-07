@@ -144,7 +144,8 @@ def model_name(sampling, nonlin):
     return SAMPLING_NAME[sampling] + nonlin_suffix(nonlin)
 
 # Settings the paper used; runs with anything else are left out of the comparison.
-PAPER_SETTINGS = {"layers": 1, "synapses": 16, "lr": 0.001, "batch_size": 128}
+PAPER_SETTINGS = {"layers": 1, "synapses": 16, "lr": 0.001, "batch_size": 128,
+                  "train_subset": None}  # --train-subset runs are quick checks, not results
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +224,8 @@ def config_key(r):
     Old result files predate --nonlin; they are the LeakyReLU baseline.
     """
     return (r["dataset"], r["sampling"], r["layers"], r["dends"], r["soma"],
-            r["synapses"], r["lr"], r["batch_size"], r["epochs"], variant_of(r))
+            r["synapses"], r["lr"], r["batch_size"], r["epochs"], variant_of(r),
+            r.get("train_subset"))
 
 
 def mean_sd(values):
@@ -239,7 +241,7 @@ def group_runs(runs):
 
     configs = []
     for key, rs in groups.items():
-        dataset, sampling, layers, dends, soma, synapses, lr, bs, epochs, nonlin = key
+        dataset, sampling, layers, dends, soma, synapses, lr, bs, epochs, nonlin, subset = key
         if is_branch(nonlin):
             _BRANCH_VARIANTS.add(nonlin)
         acc_m, acc_s = mean_sd([100 * r["test_acc"] for r in rs])
@@ -250,6 +252,7 @@ def group_runs(runs):
         configs.append(dict(
             dataset=dataset, sampling=sampling, layers=layers, dends=dends, soma=soma,
             synapses=synapses, lr=lr, batch_size=bs, epochs=epochs, nonlin=nonlin,
+            train_subset=subset,
             n_params=rs[0]["n_params"], n=len(rs), seeds=sorted(r["seed"] for r in rs),
             acc=acc_m, acc_sd=acc_s, loss=loss_m, loss_sd=loss_s, curves=curves,
         ))

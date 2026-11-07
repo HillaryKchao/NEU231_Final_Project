@@ -11,6 +11,7 @@
 #   NONLINS="ca" EXTRA="--ca-thresh 0.3" bash sweep_controls.sh # one model, extra flags
 #   EXTRA="--epochs 1 --device cpu" OUT=/tmp/dry bash sweep_controls.sh   # quick dry run
 #   caffeinate -i bash sweep_controls.sh                        # keep a Mac awake
+#   DATASET=cifar10 bash sweep_controls.sh                      # CIFAR-10 (see colab_cifar10.ipynb)
 #
 # Afterwards:
 #   python plot_results.py            -> figures/7_control_homogeneous.png, control1_homogeneous.csv,
@@ -46,7 +47,8 @@ run_one() {  # seed dends soma nonlin [mix]
   echo "=== seed $seed | ${d} dends x ${s} somata | $nl ${mix} ==="
   # shellcheck disable=SC2086  # EXTRA is meant to be word-split into flags
   $PYTHON base_model.py --dataset "$DATASET" --sampling "$SAMPLING" --layers "$LAYERS" \
-    --nonlin "$nl" "${mixflag[@]}" --dends "$d" --soma "$s" --seed "$seed" --out "$OUT" $EXTRA
+    --nonlin "$nl" ${mixflag[@]+"${mixflag[@]}"} --dends "$d" --soma "$s" --seed "$seed" \
+    --out "$OUT" $EXTRA  # the mixflag idiom keeps bash 3.2 (macOS) happy with an empty array under set -u
 }
 
 run() {

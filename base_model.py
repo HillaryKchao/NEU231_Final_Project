@@ -384,8 +384,12 @@ class DendriticANN(nn.Module):
 
 ########## Data ##########
 
-def load_data(name, data_dir, val_split=0.1, seed=0):
-    """Return flattened float32 arrays in [0, 1] (channels-last, as in the original)."""
+def load_data(name, data_dir, val_split=0.1, seed=0, train_subset=None):
+    """Return flattened float32 arrays in [0, 1] (channels-last, as in the original).
+
+    train_subset: keep only the first N shuffled training images (after the validation split,
+    which stays full). For quick checks only; such runs are tagged _nN and left out of plots.
+    """
     if name == "fmnist":
         tr = datasets.FashionMNIST(data_dir, train=True, download=True)
         te = datasets.FashionMNIST(data_dir, train=False, download=True)
@@ -408,8 +412,11 @@ def load_data(name, data_dir, val_split=0.1, seed=0):
     order = rng.permutation(len(xtr))
     xtr, ytr = xtr[order], ytr[order]
     n_val = int(val_split * len(xtr))
+    x_train, y_train = xtr[:-n_val], ytr[:-n_val]
+    if train_subset:
+        x_train, y_train = x_train[:train_subset], y_train[:train_subset]
     split = {
-        "train": (xtr[:-n_val], ytr[:-n_val]),
+        "train": (x_train, y_train),
         "val": (xtr[-n_val:], ytr[-n_val:]),
         "test": (xte, yte),
     }
@@ -523,6 +530,9 @@ def main():
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--device", default="auto", help="auto, cpu, cuda, or mps")
     p.add_argument("--data-dir", default="data")
+    p.add_argument("--train-subset", type=int, default=None,
+                   help="train on the first N shuffled training images; for quick checks only "
+                        "(run is tagged _nN and left out of the figures)")
     p.add_argument("--out", default="results")
     args = p.parse_args()
 
@@ -530,7 +540,8 @@ def main():
     device = pick_device(args.device)
     epochs = args.epochs or {"fmnist": 25, "cifar10": 50}[args.dataset]
 
-    data, img_shape, channels, n_classes = load_data(args.dataset, args.data_dir, seed=args.seed)
+    data, img_shape, channels, n_classes = load_data(args.dataset, args.data_dir, seed=args.seed,
+                                                     train_subset=args.train_subset)
     nonlin_params = dict(supra_p=args.supra_p, sub_sat=args.sub_sat, ca_thresh=args.ca_thresh,
                          ca_gain=args.ca_gain, ca_amp=args.ca_amp)
     model = DendriticANN(img_shape, channels, n_classes, dends=args.dends, soma=args.soma,
@@ -540,6 +551,8 @@ def main():
 
     print(f"dANN-{args.sampling} | {args.nonlin} dendrites | {args.dataset} | {args.layers} layer(s) | "
           f"{args.dends} dends x {args.soma} somata | {model.n_params():,} trainable params | {device}")
+    print(f"images: train {len(data['train'][0]):,} | val {len(data['val'][0]):,} | "
+          f"test {len(data['test'][0]):,}" + ("  (TRAIN SUBSET)" if args.train_subset else ""))
     hist = train(model, data, epochs, args.lr, args.batch_size, device, args.seed)
     print(f"\nTest acc: {hist['test_acc']:.4f} | Test loss: {hist['test_loss']:.4f}")
 
@@ -550,7 +563,7 @@ def main():
     if args.nonlin == "branch":
         nl += args.mix.replace(":", "-")  # dann_branch12-3-1_...
     tag = (f"dann{nl}_{args.sampling}_{args.dataset}_L{args.layers}_d{args.dends}_s{args.soma}"
-           f"_seed{args.seed}")
+           f"_seed{args.seed}" + (f"_n{args.train_subset}" if args.train_subset else ""))
     hist.update(vars(args), n_params=model.n_params(), epochs=epochs)
     (out / f"{tag}.json").write_text(json.dumps(hist, indent=2))
     torch.save(model.state_dict(), out / f"{tag}.pt")
