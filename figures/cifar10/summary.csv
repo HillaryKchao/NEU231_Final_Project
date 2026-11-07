@@ -1,0 +1,9 @@
+dataset,model,nonlin,best_size,n_params,sizes_tried,seeds,epochs,your_acc,your_acc_sd,paper_acc,paper_acc_sd,diff_pp,tolerance_pp,your_loss,paper_loss,verdict
+cifar10,dANN-LRF,leaky,16 dends x 256 somata,207626,1,3,50,57.427,0.934,56.966,0.9796,0.461,2.706,1.2332,1.2684,matches paper
+cifar10,dANN-LRF supra-only,supra,16 dends x 256 somata,207626,1,3,50,56.227,0.165,56.966,0.9796,-0.739,1.987,1.2625,1.2684,matches paper
+cifar10,dANN-LRF sub-only,sub,16 dends x 256 somata,207626,1,3,50,55.893,0.828,56.966,0.9796,-1.073,2.565,1.2636,1.2684,matches paper
+cifar10,dANN-LRF Ca-only,ca,16 dends x 256 somata,207626,1,3,50,55.503,0.235,56.966,0.9796,-1.463,2.015,1.2866,1.2684,matches paper
+cifar10,dANN-LRF + V1 mixed,v1,16 dends x 256 somata,215818,1,3,50,57.403,0.724,56.966,0.9796,0.437,2.436,1.289,1.2684,matches paper
+cifar10,dANN-LRF branch 12:3:1,branch:12:3:1,16 dends x 256 somata,207626,1,3,50,56.113,0.994,56.966,0.9796,-0.853,2.792,1.2635,1.2684,matches paper
+cifar10,dANN-LRF branch 1:1:1,branch:1:1:1,16 dends x 256 somata,207626,1,3,50,56.333,0.684,56.966,0.9796,-0.633,2.389,1.2623,1.2684,matches paper
+cifar10,dANN-LRF branch 1:3:12,branch:1:3:12,16 dends x 256 somata,207626,1,3,50,56.017,0.862,56.966,0.9796,-0.949,2.609,1.2752,1.2684,matches paper

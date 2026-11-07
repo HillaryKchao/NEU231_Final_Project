@@ -1,0 +1,2 @@
+dataset,model,size,seeds,leaky_acc,leaky_acc_sd,supra_acc,supra_acc_sd,sub_acc,sub_acc_sd,ca_acc,ca_acc_sd,v1_acc,v1_acc_sd,best_single,gap_pp,tolerance_pp,verdict
+cifar10,dANN-LRF,16 dends x 256 somata,3,57.427,0.934,56.227,0.165,55.893,0.828,55.503,0.235,57.403,0.724,leaky,-0.023,2.363,single is enough
