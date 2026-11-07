@@ -89,7 +89,7 @@ applied to the learned apical sum, so the apical bias can shift the effective th
 
 ## CIFAR-10 on Colab
 
-[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/HillaryKchao/NEU231_Final_Project/blob/v1-nonlinearities/colab_cifar10.ipynb)
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/HillaryKchao/NEU231_Final_Project/blob/bio-tuning/colab_cifar10.ipynb)
 
 CIFAR-10 is a single 160 MB archive and each epoch reads all of it, so training needs the
 dataset on the machine doing the work. `colab_cifar10.ipynb` runs the whole comparison on a
