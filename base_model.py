@@ -429,7 +429,9 @@ class DendriticANN(nn.Module):
         rng = np.random.default_rng(seed)
         self.nonlin, self.mix, self.basal_nonlin = nonlin, mix, basal_nonlin
         params = dict(nonlin_params or {})
-        gate_params = {k: params.pop(k) for k in ("ca_thresh", "ca_gain", "ca_amp") if k in params}
+        # the gate's soma takes the Ca constants; every other model keeps them in its dendrites
+        gate_params = ({k: params.pop(k) for k in ("ca_thresh", "ca_gain", "ca_amp") if k in params}
+                       if nonlin == "gate" else {})
         n_ch = 3 if nonlin == "v1" else 1  # channels per dendrite feeding the soma
         self.dend_layers = nn.ModuleList()
         self.soma_layers = nn.ModuleList()
