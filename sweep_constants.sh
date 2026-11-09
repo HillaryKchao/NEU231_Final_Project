@@ -13,6 +13,7 @@
 # Env: SEEDS (1), SIZES (16x256), DATASET (fmnist), SAMPLING (local), LAYERS (1), OUT (results),
 #      GRID (file of grid lines; '#' comments allowed; default = the grid below), EXTRA, PYTHON, LOG.
 set -u
+export PYTHONUNBUFFERED=1   # show each epoch line as it happens, even through tee
 SEEDS=${SEEDS:-"1"}
 SIZES=${SIZES:-"16x256"}
 DATASET=${DATASET:-fmnist}

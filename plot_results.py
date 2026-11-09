@@ -315,16 +315,32 @@ def group_runs(runs):
             n_params=rs[0]["n_params"], n=len(rs), seeds=sorted(r["seed"] for r in rs),
             acc=acc_m, acc_sd=acc_s, loss=loss_m, loss_sd=loss_s, curves=curves,
             val_acc=val_m, val_acc_sd=val_s,
+            val_by_seed={r["seed"]: 100 * r["val_acc"][-1] for r in rs},
         ))
     return configs
+
+
+def selection_scores(cs):
+    """Validation score used to choose between variants of one model, one per config in `cs`.
+
+    Variants are compared on the seeds they all share (stage 1 trains every variant with the
+    same seed), so a winner that later gets more seeds is not penalised or favoured against
+    single-seed variants just because its mean now covers different seeds. With no shared
+    seed the plain mean over each variant's own seeds is used.
+    """
+    common = set.intersection(*(set(c["val_by_seed"]) for c in cs)) if cs else set()
+    if not common:
+        return [c["val_acc"] for c in cs]
+    return [float(np.mean([c["val_by_seed"][k] for k in common])) for c in cs]
 
 
 def select_variants(configs, mode="default"):
     """One config per (dataset, sampling, size, base model) for the comparison figures.
 
     'default'  keeps the variant with default constants (tuned variants are left out).
-    'best-val' keeps the variant with the highest mean validation accuracy. Test accuracy is
-               never consulted, so the test numbers of the chosen variants stay honest.
+    'best-val' keeps the variant with the highest validation accuracy on the seeds all
+               variants share (see selection_scores). Test accuracy is never consulted, so
+               the test numbers of the chosen variants stay honest.
     Returned configs have `nonlin` set to the base name and `variant` to the full key.
     """
     groups = defaultdict(list)
@@ -333,7 +349,7 @@ def select_variants(configs, mode="default"):
     chosen = []
     for (ds, s, d, so, base), cs in groups.items():
         if mode == "best-val":
-            pick = max(cs, key=lambda c: c["val_acc"])
+            pick = cs[int(np.argmax(selection_scores(cs)))]
         else:
             plain = [c for c in cs if c["nonlin"] == base]
             if not plain:
@@ -786,12 +802,14 @@ def write_constants_sweep(configs, out):
     """constants_sweep.csv: every variant of each tuned model, ranked by validation accuracy."""
     rows, winners = [], []
     for (ds, s, dends, soma, base), cs in _variants_by_base(configs):
-        ranked = sorted(cs, key=lambda c: -c["val_acc"])
+        score = dict(zip((c["nonlin"] for c in cs), selection_scores(cs)))
+        ranked = sorted(cs, key=lambda c: -score[c["nonlin"]])
         winners.append(ranked[0])
         for i, c in enumerate(ranked):
             rows.append({"dataset": ds, "model": SAMPLING_NAME[s],
                          "size": f"{dends} dends x {soma} somata", "base": nonlin_label(base),
                          "variant": variant_suffix(c["nonlin"]) or "(defaults)", "seeds": c["n"],
+                         "val_matched": round(score[c["nonlin"]], 3),
                          "val_acc": round(c["val_acc"], 3), "val_acc_sd": round(c["val_acc_sd"], 3),
                          "test_acc": round(c["acc"], 3), "test_acc_sd": round(c["acc_sd"], 3),
                          "selected": "yes" if i == 0 else "", "grid_line": grid_line(c)})
@@ -805,12 +823,13 @@ def write_constants_sweep(configs, out):
         w.writerows(rows)
     print(f"  wrote {path}")
 
-    print("\nConstants sweep: variants ranked by VALIDATION accuracy (%), test shown for reference")
+    print("\nConstants sweep: variants ranked by VALIDATION accuracy (%) on the seeds they share "
+          "('matched'); test shown for reference")
     print(f"{'dataset':9s} {'size':22s} {'model':20s} {'variant':26s} {'seeds':>5s}  "
-          f"{'val acc':>14s}  {'test acc':>14s}  pick")
+          f"{'matched':>7s}  {'val acc':>14s}  {'test acc':>14s}  pick")
     for r in rows:
         print(f"{r['dataset']:9s} {r['size']:22s} {r['base']:20s} {r['variant']:26s} "
-              f"{r['seeds']:>5d}  {r['val_acc']:6.2f} +/- {r['val_acc_sd']:4.2f}  "
+              f"{r['seeds']:>5d}  {r['val_matched']:7.2f}  {r['val_acc']:6.2f} +/- {r['val_acc_sd']:4.2f}  "
               f"{r['test_acc']:6.2f} +/- {r['test_acc_sd']:4.2f}  {'<-' if r['selected'] else ''}")
     if any(r["seeds"] < 2 for r in rows):
         print("  note: single-seed variants; differences under ~1 pp are noise. Rerun the "
@@ -841,7 +860,7 @@ def fig_constants_sweep(configs, datasets, out):
         ax.errorbar(x, val, yerr=vsd, fmt="o", ms=7, mfc=color, mec=SURFACE, mew=1.2,
                     ecolor=color, elinewidth=1.3, capsize=3, label="validation", zorder=4)
         ax.plot(x, test, "o", ms=7, mfc="none", mec=color, mew=1.3, label="test", zorder=3)
-        best = int(np.argmax(val))
+        best = int(np.argmax(selection_scores(cs)))
         ax.annotate("selected", (x[best], val[best]), xytext=(0, 9), textcoords="offset points",
                     ha="center", fontsize=8, color=INK_2)
         ax.set_xticks(x)
@@ -855,8 +874,9 @@ def fig_constants_sweep(configs, datasets, out):
     axes.flat[0].legend(loc="lower right")
     _finish(fig, out / "9_constants_sweep.png",
             "Each panel is one model whose fixed constants were varied; x labels are the "
-            "non-default settings. Filled: validation accuracy (used to select), hollow: test. "
-            "Error bars: SD over seeds (none for single-seed runs).")
+            "non-default settings. Filled: validation accuracy, hollow: test. Error bars: SD over "
+            "seeds (none for single-seed runs). 'selected' is the best validation accuracy on "
+            "the seed every variant was trained with.")
 
 
 # ---------------------------------------------------------------------------

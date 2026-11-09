@@ -20,6 +20,7 @@
 #                                        figures/8_ratio_sweep.png, ratio_sweep.csv
 #   python analyze_v1.py results/dann_v1_local_fmnist_L1_d16_s256_seed1 --data-dir data
 set -u
+export PYTHONUNBUFFERED=1   # show each epoch line as it happens, even through tee
 SEEDS=${SEEDS:-"1 2 3"}
 SIZES=${SIZES:-"16x256"}                      # dendrites x somata, space separated
 NONLINS=${NONLINS:-"leaky supra sub ca v1"}   # base_model.py --nonlin values (branch loops MIXES)
