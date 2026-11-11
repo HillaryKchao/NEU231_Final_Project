@@ -115,21 +115,22 @@ def run_constants(r):
     """The constants a run used, with defaults filled in for files that predate a flag."""
     c = {k: (r.get(k) if r.get(k) is not None else d) for k, d in CONSTANT_DEFAULTS.items()}
     c["basal_nonlin"] = r.get("basal_nonlin") or "leaky"
+    c["weight_decay"] = float(r.get("weight_decay") or 0.0)  # files before --weight-decay: 0
     return c
 
 
 def constants_parts(consts, nonlin):
     """['bsupra', 'thr0.5', 'leak0.1']: the non-default settings, in a fixed order."""
-    if nonlin == "leaky":
-        return []
     parts = []
     if nonlin == "gate" and consts.get("basal_nonlin", "leaky") != "leaky":
         parts.append(f"b{consts['basal_nonlin']}")
     for key, default in CONSTANT_DEFAULTS.items():
-        if key == "apical_frac" and nonlin != "gate":
-            continue
+        if nonlin == "leaky" or (key == "apical_frac" and nonlin != "gate"):
+            continue  # the paper baseline has no nonlinearity constants
         if float(consts.get(key, default)) != default:
             parts.append(f"{CONSTANT_SHORT[key]}{float(consts[key]):g}")
+    if consts.get("weight_decay"):  # applies to every model, the baseline included
+        parts.append(f"wd{float(consts['weight_decay']):g}")
     return parts
 
 
@@ -316,6 +317,10 @@ def group_runs(runs):
             acc=acc_m, acc_sd=acc_s, loss=loss_m, loss_sd=loss_s, curves=curves,
             val_acc=val_m, val_acc_sd=val_s,
             val_by_seed={r["seed"]: 100 * r["val_acc"][-1] for r in rs},
+            acc_by_seed={r["seed"]: 100 * r["test_acc"] for r in rs},
+            # early-stopped test accuracy; only runs made after it was recorded have it
+            acc_best_by_seed={r["seed"]: 100 * r["test_acc_best_val"] for r in rs
+                              if "test_acc_best_val" in r},
         ))
     return configs
 
@@ -791,10 +796,12 @@ def grid_line(c):
     if base == "gate" and k.get("basal_nonlin", "leaky") != "leaky":
         flags.append(f"--basal-nonlin {k['basal_nonlin']}")
     for key, default in CONSTANT_DEFAULTS.items():
-        if key == "apical_frac" and base != "gate":
+        if base == "leaky" or (key == "apical_frac" and base != "gate"):
             continue
         if float(k.get(key, default)) != default:
             flags.append(f"--{key.replace('_', '-')} {float(k[key]):g}")
+    if k.get("weight_decay"):
+        flags.append(f"--weight-decay {float(k['weight_decay']):g}")
     return f"{head}|{' '.join(flags)}"
 
 
@@ -877,6 +884,193 @@ def fig_constants_sweep(configs, datasets, out):
             "non-default settings. Filled: validation accuracy, hollow: test. Error bars: SD over "
             "seeds (none for single-seed runs). 'selected' is the best validation accuracy on "
             "the seed every variant was trained with.")
+
+
+# ---------------------------------------------------------------------------
+# Paired comparison with the baseline (same seed = same data split and wiring)
+# ---------------------------------------------------------------------------
+
+def t_two_sided_p(t, df):
+    """Two-sided p-value of Student's t, by integrating the density (no SciPy needed)."""
+    if df < 1 or not math.isfinite(t):
+        return float("nan")
+    x = np.linspace(0.0, abs(t), 20001)
+    logc = math.lgamma((df + 1) / 2) - math.lgamma(df / 2) - 0.5 * math.log(df * math.pi)
+    pdf = np.exp(logc - (df + 1) / 2 * np.log1p(x ** 2 / df))
+    area = float(np.sum((pdf[1:] + pdf[:-1]) * np.diff(x)) / 2)  # P(0 < T < |t|)
+    return max(0.0, 1.0 - 2.0 * area)
+
+
+def paired_stats(a, b):
+    """Differences a - b over the seeds both dicts {seed: value} share."""
+    seeds = sorted(set(a) & set(b))
+    d = np.array([a[k] - b[k] for k in seeds], dtype=float)
+    n = len(d)
+    if n == 0:
+        return None
+    mean = float(d.mean())
+    sd = float(d.std(ddof=1)) if n > 1 else 0.0
+    t = mean / (sd / math.sqrt(n)) if n > 1 and sd > 0 else float("nan")
+    return dict(n=n, seeds=seeds, diffs=d, mean=mean, sd=sd, t=t,
+                p=t_two_sided_p(t, n - 1) if n > 1 else float("nan"), wins=int((d > 0).sum()))
+
+
+def _same_decay_baseline(c, by_variant):
+    """The LeakyReLU run this model should be paired with: same weight decay."""
+    wd = c["constants"].get("weight_decay", 0.0)
+    return by_variant.get(f"leaky@wd{wd:g}" if wd else "leaky")
+
+
+def write_paired(configs, selected, out):
+    """paired_vs_baseline.csv: each model minus the LeakyReLU baseline, seed by seed.
+
+    Runs with the same seed share the data split and the synaptic wiring, so the paired
+    difference removes seed-to-seed variation that the unpaired SDs include. Lists the
+    selected variant of every model plus any other variant with at least two shared seeds
+    (so controls such as a gain sweep all appear). Models trained with weight decay are
+    paired with the baseline trained with the same weight decay.
+    """
+    all_by_size = defaultdict(dict)
+    for c in configs:
+        all_by_size[(c["dataset"], c["sampling"], c["dends"], c["soma"])][c["nonlin"]] = c
+    rows = []
+    for key, sel in _size_groups(selected):
+        by_variant = all_by_size[key]
+        picked = {c["variant"] for c in sel.values()}
+        for v in sorted(by_variant, key=nonlin_rank):
+            c = by_variant[v]
+            base = _same_decay_baseline(c, by_variant)
+            if base is None or base is c:
+                continue
+            st = paired_stats(c["acc_by_seed"], base["acc_by_seed"])
+            if st is None or (v not in picked and st["n"] < 2):
+                continue
+            best = paired_stats(c["acc_best_by_seed"], base["acc_best_by_seed"])
+            ds, s, dends, soma = key
+            rows.append({
+                "dataset": ds, "model": SAMPLING_NAME[s], "size": f"{dends} dends x {soma} somata",
+                "variant": nonlin_label(v), "baseline": nonlin_label(base["nonlin"]),
+                "seeds": st["n"], "acc": round(float(np.mean([c["acc_by_seed"][k] for k in st["seeds"]])), 3),
+                "baseline_acc": round(float(np.mean([base["acc_by_seed"][k] for k in st["seeds"]])), 3),
+                "diff": round(st["mean"], 3), "diff_sd": round(st["sd"], 3),
+                "t": round(st["t"], 3) if math.isfinite(st["t"]) else "",
+                "p": round(st["p"], 4) if math.isfinite(st["p"]) else "",
+                "wins": f"{st['wins']}/{st['n']}", "selected": "yes" if v in picked else "",
+                "diff_early_stop": round(best["mean"], 3) if best else "",
+                "seeds_early_stop": best["n"] if best else 0,
+            })
+    if not rows:
+        print("  skipping paired_vs_baseline.csv: no model shares seeds with the baseline")
+        return rows
+    path = out / "paired_vs_baseline.csv"
+    with path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    print(f"  wrote {path}")
+
+    wv = max(len(r["variant"]) for r in rows)
+    wb = max(len(r["baseline"]) for r in rows)
+    print("\nPaired with the baseline on shared seeds: test accuracy difference (pp)")
+    print(f"{'dataset':9s} {'size':22s} {'model':{wv}s} {'vs':{wb}s} {'n':>2s}  {'acc':>6s} "
+          f"{'base':>6s}  {'diff':>14s}  {'t':>6s} {'p':>7s}  {'wins':>4s} {'pick':>4s}  early-stop diff")
+    for r in rows:
+        t = f"{r['t']:6.2f}" if r["t"] != "" else f"{'':6s}"
+        pv = f"{r['p']:7.4f}" if r["p"] != "" else f"{'':7s}"
+        es = (f"{r['diff_early_stop']:+.2f} (n={r['seeds_early_stop']})"
+              if r["diff_early_stop"] != "" else "n/a")
+        print(f"{r['dataset']:9s} {r['size']:22s} {r['variant']:{wv}s} {r['baseline']:{wb}s} "
+              f"{r['seeds']:>2d}  {r['acc']:6.2f} {r['baseline_acc']:6.2f}  "
+              f"{r['diff']:+6.2f} +/- {r['diff_sd']:4.2f}  {t} {pv}  {r['wins']:>4s} "
+              f"{'<-' if r['selected'] else '':>4s}  {es}")
+    print("  note: p is a two-sided paired t-test over seeds, uncorrected for the number of "
+          "models compared; with few seeds treat it as suggestive. 'early-stop diff' uses test "
+          "accuracy at each run's best-validation epoch (n/a for runs made before it was saved).")
+    return rows
+
+
+def fig_size_generalisation(configs, selected, datasets, out):
+    """Does a model's edge over the baseline hold at other model sizes?"""
+    plain = {(c["dataset"], c["sampling"], c["dends"], c["soma"]): c
+             for c in configs if c["nonlin"] == "leaky"}
+    # One variant per model, the same at every size: the one trained at the most sizes
+    # (ties go to the variant --select picked more often), so the line compares like with like.
+    picked = defaultdict(int)
+    for c in selected:
+        picked[(c["dataset"], c["sampling"], c["variant"])] += 1
+    by_variant = defaultdict(list)  # (dataset, sampling, variant) -> [(size key, config, baseline)]
+    for c in configs:
+        key = (c["dataset"], c["sampling"], c["dends"], c["soma"])
+        if (base_of(c["nonlin"]) == "leaky" or key not in plain or c["dataset"] not in datasets
+                or c["constants"].get("weight_decay")):
+            continue  # decayed models are compared in the paired table, not here
+        by_variant[(c["dataset"], c["sampling"], c["nonlin"])].append((key, c, plain[key]))
+    lines = {}  # (dataset, sampling, base) -> [(size key, config, baseline)]
+    for (ds, s, v), pts in by_variant.items():
+        k = (ds, s, base_of(v))
+        rank = (len(pts), picked[(ds, s, v)])
+        if k not in lines or rank > lines[k][0]:
+            lines[k] = (rank, pts)
+    lines = {k: pts for k, (_, pts) in lines.items()}
+    lines = {k: sorted(v, key=lambda t: t[1]["n_params"]) for k, v in lines.items() if len(v) > 1}
+    if not lines:
+        print("  skipping 11_size_generalisation.png: no tuned model at two or more sizes")
+        return
+    rows = sorted({(ds, s) for ds, s, _ in lines},
+                  key=lambda k: (k[0], SAMPLING_ORDER.index(k[1])))
+    fig, axes = plt.subplots(len(rows), 2, figsize=(10, 3.8 * len(rows)), squeeze=False)
+    for r, (ds, s) in enumerate(rows):
+        ax, axd = axes[r]
+        bases = sorted((b for d2, s2, b in lines if (d2, s2) == (ds, s)), key=nonlin_rank)
+        sizes = sorted({t[0] for b in bases for t in lines[(ds, s, b)]},
+                       key=lambda k: plain[k]["n_params"])
+        xs = {k: i for i, k in enumerate(sizes)}
+        base_cs = [plain[k] for k in sizes]
+        ax.errorbar([c["n_params"] for c in base_cs], [c["acc"] for c in base_cs],
+                    yerr=[c["acc_sd"] for c in base_cs], color=NONLIN_COLOR["leaky"],
+                    mec=SURFACE, mew=1.2, capsize=3, elinewidth=1.2,
+                    label=nonlin_label("leaky"), **NONLIN_STYLE["leaky"])
+        width = 0.8 / len(bases)
+        for j, b in enumerate(bases):
+            pts = lines[(ds, s, b)]
+            color = nonlin_color(b)
+            label = nonlin_label(pts[0][1]["nonlin"])
+            ax.errorbar([c["n_params"] for _, c, _ in pts], [c["acc"] for _, c, _ in pts],
+                        yerr=[c["acc_sd"] for _, c, _ in pts], color=color, mec=SURFACE,
+                        mew=1.2, capsize=3, elinewidth=1.2, label=label, **nonlin_style(b))
+            for k, c, base in pts:
+                st = paired_stats(c["acc_by_seed"], base["acc_by_seed"])
+                if st is None:
+                    continue
+                x = xs[k] + (j - (len(bases) - 1) / 2) * width
+                axd.errorbar(x, st["mean"], yerr=st["sd"], fmt=nonlin_style(b)["marker"], ms=8,
+                             mfc=color, mec=SURFACE, mew=1.2, ecolor=color, elinewidth=1.3,
+                             capsize=4, zorder=4)
+                axd.plot(np.full(st["n"], x + 0.12), st["diffs"], ".", ms=5, color=color,
+                         alpha=0.55, zorder=3)
+                axd.annotate(f"{st['mean']:+.2f}\n{st['wins']}/{st['n']} seeds", (x, st["mean"]),
+                             xytext=(-10, 0), textcoords="offset points", ha="right",
+                             va="center", fontsize=8, color=INK)
+        ax.set_xscale("log")
+        _plain_log_ticks(ax.xaxis)
+        ax.margins(x=0.12)
+        ax.set_xlabel("Trainable parameters (log scale)")
+        ax.set_ylabel("Test accuracy (%)")
+        ax.set_title(f"{DATASET_NAME.get(ds, ds)}, {SAMPLING_NAME[s]}: accuracy by model size")
+        ax.legend(loc="lower right")
+        axd.axhline(0, color=MUTED, lw=1)
+        axd.set_xticks(range(len(sizes)))
+        axd.set_xticklabels([f"{k[2]} x {k[3]}" for k in sizes])
+        axd.set_xlim(-0.7, len(sizes) - 0.4)
+        axd.grid(axis="x", visible=False)
+        axd.margins(y=0.25)
+        axd.set_xlabel("dendrites x somata")
+        axd.set_ylabel("Accuracy minus baseline (pp)")
+        axd.set_title("Paired difference, same seeds")
+    _finish(fig, out / "11_size_generalisation.png",
+            "Left: mean and SD over seeds at each model size. Right: each model minus the "
+            "LeakyReLU baseline trained with the same seed (large marker: mean and SD of the "
+            "differences; small dots: individual seeds). Above zero means better than the baseline.")
 
 
 # ---------------------------------------------------------------------------
@@ -1104,10 +1298,12 @@ def main():
     fig_control_homogeneous(selected, datasets, out)
     fig_ratio_sweep(selected, datasets, out)
     fig_constants_sweep(comparable, datasets, out)
+    fig_size_generalisation(comparable, selected, datasets, out)
     print_summary(write_summary(best, n_configs, out))
     write_control_homogeneous(selected, out)
     write_ratio_sweep(selected, out)
     write_constants_sweep(comparable, out)
+    write_paired(comparable, selected, out)
 
 
 if __name__ == "__main__":

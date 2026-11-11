@@ -173,6 +173,57 @@ def report_activity(model, r, data_dir, n=2048):
         print("    note: the Ca channel almost never fires; try a lower --ca-thresh")
 
 
+@torch.no_grad()
+def report_dendrite_states(model, r, data_dir, out, n=2048, make_fig=True):
+    """Are the Ca dendrites used as on/off switches? Looks at layer 0 on validation images.
+
+    The Ca plateau is sigmoid(gain * (u - theta)) in [0, 1] (leak and amplitude left out, so
+    0 is fully off and 1 fully on). Reports how much of the time a dendrite sits near either
+    end, and whether each dendrite is selective (on for some images, off for others) or stuck.
+    """
+    act = model.dend_act
+    bank = act.bank if hasattr(act, "type_idx") else act
+    if "ca" not in bank.channels:
+        return
+    data, *_ = load_data(r["dataset"], data_dir, seed=r["seed"])
+    x = torch.as_tensor(data["val"][0][:n])
+    u = model.dend_layers[0](x)                                    # (n, D)
+    if hasattr(act, "type_idx"):                                   # branch: only the Ca dendrites
+        u = u[:, act.type_idx == list(act.channels).index("ca")]
+    if u.shape[1] == 0:
+        return
+    ca = torch.sigmoid(bank.ca_gain * (u - bank.ca_thresh))        # (n, n_ca_dendrites)
+    off, on = (ca < 0.1).float().mean().item(), (ca > 0.9).float().mean().item()
+    rate = (ca > 0.5).float().mean(0)                              # per dendrite: frac of images on
+    stuck_off, stuck_on = (rate < 0.02).float().mean().item(), (rate > 0.98).float().mean().item()
+    print(f"  Ca dendrite states on {n} validation images (layer 0, {u.shape[1]:,} Ca dendrites, "
+          f"threshold {bank.ca_thresh:g}, gain {bank.ca_gain:g}):")
+    print(f"    (image, dendrite) pairs: off (<0.1) {off:.3f} | graded {1 - off - on:.3f} | "
+          f"on (>0.9) {on:.3f}")
+    print(f"    dendrites: always off {stuck_off:.3f} | selective {1 - stuck_off - stuck_on:.3f} "
+          f"| always on {stuck_on:.3f}   (on = above 0.5 for an image; always = >98% of images)")
+    print(f"    selective dendrites are on for a median {rate[(rate >= 0.02) & (rate <= 0.98)].median().item() if ((rate >= 0.02) & (rate <= 0.98)).any() else float('nan'):.3f} "
+          f"of images; mean on-rate over all dendrites {rate.mean():.3f}")
+    if make_fig:
+        color = CHANNEL_COLOR["ca"]
+        fig, axes = plt.subplots(1, 2, figsize=(9, 3.4))
+        axes[0].hist(ca.flatten().numpy(), bins=50, color=color, lw=0)
+        axes[0].set_xlabel("Ca output (per image, per dendrite)")
+        axes[0].set_ylabel("count")
+        axes[0].set_title(f"Dendrite output: {100 * (off + on):.0f}% near 0 or 1")
+        axes[1].hist(rate.numpy(), bins=50, range=(0, 1), color=color, lw=0)
+        axes[1].set_xlabel("fraction of images for which the dendrite is on")
+        axes[1].set_ylabel("dendrites")
+        axes[1].set_title(f"Selectivity: {100 * (1 - stuck_off - stuck_on):.0f}% of dendrites switch")
+        _finish(fig, out / "12_dendrite_states.png",
+                f"{r['dataset']}, {r['nonlin']} dendrites, "
+                f"{r['dends']} x {r['soma']}, seed {r['seed']}, Ca threshold {bank.ca_thresh:g}, "
+                f"gain {bank.ca_gain:g}. Left: the Ca output sigmoid(gain (u - threshold)) over "
+                "validation images and dendrites; mass at the two ends means dendrites act as "
+                "on/off units. Right: how often each dendrite is on; dendrites at 0 or 1 never "
+                "change state and carry no information about the image.")
+
+
 def fig_curves(bank, path):
     u = torch.linspace(-2, 3, 500)[:, None]
     y = bank(u).numpy()
@@ -242,7 +293,8 @@ def main():
             fig_curves(bank, out / "5_v1_nonlinearities.png")
         if not branch and act.n_channels == 1:
             print(f"  single-channel run ({act.channels[0]}-only): every soma reads only that "
-                  "channel, so there is no channel usage to report")
+                  "channel, so there is no channel usage to report"
+                  + ("" if args.data_dir else " (pass --data-dir for dendrite activity)"))
         else:
             D = r["dends"] * r["soma"]
             groups = row_groups(act, D)
@@ -268,6 +320,7 @@ def main():
                                   ch, note)
         if args.data_dir:
             report_activity(model, r, args.data_dir)
+            report_dendrite_states(model, r, args.data_dir, out, make_fig=(i == 0))
 
 
 if __name__ == "__main__":

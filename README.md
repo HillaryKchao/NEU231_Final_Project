@@ -87,6 +87,35 @@ baseline's; there is one extra bias vector. `analyze_v1.py` reports how often th
 and the correlation between basal drive and gate (`10_gate_activity.png`). Note that theta is
 applied to the learned apical sum, so the apical bias can shift the effective threshold.
 
+## Follow-up experiments: is the Ca-only result real, and why?
+
+With a working threshold (`--ca-thresh 0`), Ca-only dendrites beat the LeakyReLU baseline on
+CIFAR-10 at 16 x 256. Four checks, all run through `sweep_constants.sh` grids (section 5e of the
+Colab notebook has the cells):
+
+- **Other sizes.** `SIZES="8x128 32x256" SEEDS="1 2 3"` with grid lines `leaky|` and
+  `ca|--ca-thresh 0`. `11_size_generalisation.png` shows accuracy by size and the paired
+  difference from the baseline at each size.
+- **Steepness or just a sigmoid?** At threshold 0 the Ca function is `sigmoid(gain * u)`, and
+  the synaptic weights can absorb the gain, so `--ca-gain 1 / 3 / 30` only tests sensitivity to
+  the initial steepness. The matched control is `--nonlin sub --sub-sat 0.2`:
+  `0.2 tanh(5u) = 0.4 sigmoid(10u) - 0.2`, the same curve up to a shift and scale the soma
+  absorbs. If it matches Ca-only, the result is about steep bounded dendrites, not Ca spikes
+  specifically.
+- **Regularisation.** `--weight-decay W` is Adam's L2 penalty on every parameter, biases
+  included (runs are tagged `_wd<W>`; default 0 = the paper). Every run now also saves
+  `test_acc_best_val`, the test accuracy at its best-validation epoch (early stopping chosen on
+  validation, never on test). `test_acc` is still the final epoch.
+- **What the dendrites do.** `analyze_v1.py <ca run> --data-dir data` reports how often Ca
+  dendrites sit near 0 or 1 and how many are selective, stuck off or stuck on
+  (`12_dendrite_states.png`).
+
+`plot_results.py` writes `paired_vs_baseline.csv`: each model minus the baseline on the seeds
+they share (same seed = same data split and wiring), with the SD of the differences, a paired
+t-test and the number of seeds won. Decayed models are paired with the equally decayed
+baseline. The p-values are not corrected for the number of models compared; with 3 to 5 seeds
+they are suggestive, not conclusive.
+
 ## CIFAR-10 on Colab
 
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/HillaryKchao/NEU231_Final_Project/blob/bio-tuning/colab_cifar10.ipynb)

@@ -547,7 +547,7 @@ def evaluate(model, x, y, batch_size):
     return total_loss / len(x), correct / len(x)
 
 
-def train(model, data, epochs, lr, batch_size, device, seed):
+def train(model, data, epochs, lr, batch_size, device, seed, weight_decay=0.0):
     """The training loop. For each epoch it:
 
     1. Shuffles the training images.
@@ -559,16 +559,23 @@ def train(model, data, epochs, lr, batch_size, device, seed):
     3. Records training loss and accuracy, then calls evaluate on the validation set and
     prints a progress line.
 
-    4. After the last epoch it evaluates once on the test set. It returns a dictionary of all these numbers."""
+    4. After the last epoch it evaluates once on the test set. It returns a dictionary of all these numbers.
+
+    Whenever validation accuracy reaches a new best, the test set is also evaluated and kept as
+    test_acc_best_val / test_loss_best_val (early stopping chosen on validation, never on test).
+    test_acc / test_loss stay the final-epoch values. weight_decay is Adam's L2 penalty on
+    every parameter (0 = the paper's setting)."""
 
     to_t = lambda a, dt: torch.as_tensor(a, dtype=dt, device=device)
     xtr, ytr = to_t(data["train"][0], torch.float32), to_t(data["train"][1], torch.long)
     xva, yva = to_t(data["val"][0], torch.float32), to_t(data["val"][1], torch.long)
     xte, yte = to_t(data["test"][0], torch.float32), to_t(data["test"][1], torch.long)
 
-    opt = torch.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.999))
+    opt = torch.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.999),
+                           weight_decay=weight_decay)
     gen = torch.Generator().manual_seed(seed)
     hist = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
+    best_val = -1.0
 
     for ep in range(epochs):
         t0 = time.time()
@@ -589,6 +596,11 @@ def train(model, data, epochs, lr, batch_size, device, seed):
         hist["train_acc"].append(run_correct / len(xtr))
         hist["val_loss"].append(vl)
         hist["val_acc"].append(va)
+        if va > best_val:  # first epoch to reach this validation accuracy
+            best_val = va
+            hist["best_val_epoch"] = ep + 1
+            hist["test_loss_best_val"], hist["test_acc_best_val"] = evaluate(model, xte, yte,
+                                                                             batch_size)
         print(f"epoch {ep + 1:3d}/{epochs}  train loss {hist['train_loss'][-1]:.4f} "
               f"acc {hist['train_acc'][-1]:.4f} | val loss {vl:.4f} acc {va:.4f} "
               f"| {time.time() - t0:.1f}s")
@@ -600,14 +612,17 @@ def train(model, data, epochs, lr, batch_size, device, seed):
 def run_tag(args):
     """Results file stem. The paper baseline keeps its original tag; other nonlinearities are
     named (dann_v1_..., dann_branch12-3-1_..., dann_gate_bsupra_...), non-default constants
-    add a suffix (_thr0.5_leak0.1) and --train-subset adds _nN."""
+    add a suffix (_thr0.5_leak0.1), --weight-decay adds _wd<value> (for any model, the baseline
+    included) and --train-subset adds _nN."""
     nl = "" if args.nonlin == "leaky" else f"_{args.nonlin}"
     if args.nonlin == "branch":
         nl += args.mix.replace(":", "-")
     if args.nonlin == "gate" and args.basal_nonlin != "leaky":
         nl += f"_b{args.basal_nonlin}"
     return (f"dann{nl}_{args.sampling}_{args.dataset}_L{args.layers}_d{args.dends}_s{args.soma}"
-            f"{constants_suffix(vars(args), args.nonlin)}_seed{args.seed}"
+            f"{constants_suffix(vars(args), args.nonlin)}"
+            + (f"_wd{args.weight_decay:g}" if getattr(args, "weight_decay", 0) else "")
+            + f"_seed{args.seed}"
             + (f"_n{args.train_subset}" if args.train_subset else ""))
 
 
@@ -645,6 +660,8 @@ def main():
     p.add_argument("--epochs", type=int, default=None, help="default: 25 fmnist, 50 cifar10")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--batch-size", type=int, default=128)
+    p.add_argument("--weight-decay", type=float, default=0.0,
+                   help="Adam L2 weight decay on all parameters (0 = paper; run is tagged _wd<value>)")
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--device", default="auto", help="auto, cpu, cuda, or mps")
     p.add_argument("--data-dir", default="data")
@@ -680,8 +697,10 @@ def main():
           f"{args.dends} dends x {args.soma} somata | {model.n_params():,} trainable params | {device}")
     print(f"images: train {len(data['train'][0]):,} | val {len(data['val'][0]):,} | "
           f"test {len(data['test'][0]):,}" + ("  (TRAIN SUBSET)" if args.train_subset else ""))
-    hist = train(model, data, epochs, args.lr, args.batch_size, device, args.seed)
-    print(f"\nTest acc: {hist['test_acc']:.4f} | Test loss: {hist['test_loss']:.4f}")
+    hist = train(model, data, epochs, args.lr, args.batch_size, device, args.seed,
+                 weight_decay=args.weight_decay)
+    print(f"\nTest acc: {hist['test_acc']:.4f} | Test loss: {hist['test_loss']:.4f}"
+          f" | at best-validation epoch {hist['best_val_epoch']}: {hist['test_acc_best_val']:.4f}")
 
     out.mkdir(parents=True, exist_ok=True)
     hist.update(vars(args), n_params=model.n_params(), epochs=epochs)
