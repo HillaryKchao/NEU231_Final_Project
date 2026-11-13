@@ -8,6 +8,59 @@ pip install -r requirements.txt
 
 python base_model.py --dataset fmnist --dends 16 --soma 128 --sampling local
 
+## Results and conclusions
+
+**In short:** the replication matches the paper, and biologically inspired dendritic
+nonlinearities do not meaningfully improve on its LeakyReLU dendrite. The one variant that
+wins is a steep saturating dendrite, by about one point at the paper's model size; the gain
+disappears at a larger size and is not specific to calcium spikes.
+
+All numbers are test accuracy (%) for dANN-LRF, mean +/- SD over seeds, at 16 dendrites x 256
+somata unless stated. "Paired" differences compare runs with the same seed (same data split
+and wiring). Tables: `figures/cifar10/` and `figures/control1/` (Fashion-MNIST), in
+`summary.csv`, `constants_sweep.csv` and `paired_vs_baseline.csv`.
+
+| Model | CIFAR-10 | Seeds | Paired difference from baseline |
+|---|---|---|---|
+| LeakyReLU (paper's model; paper reports 56.97 +/- 0.98) | 57.32 +/- 0.85 | 5 | |
+| Ca-only, threshold 0 | 58.22 +/- 0.91 | 5 | +0.90 +/- 0.59, p = 0.03, 4 of 5 seeds |
+| Matched tanh (`sub`, saturation 0.2) | 58.55 +/- 0.39 | 3 | +1.12 +/- 1.09 |
+| V1 mixed, threshold 0 | 58.57 +/- 0.50 | 3 | +1.14 +/- 1.33 |
+| Ca gate | 57.56 +/- 0.64 | 3 | +0.13 +/- 0.32 |
+| supra-only, tuned (p 1.5, leak 0.1) | 56.72 +/- 0.31 | 3 | -0.71 +/- 1.12 |
+| Ca-only, default threshold 1.0 | 55.50 +/- 0.23 | 3 | -1.92 +/- 1.11 |
+| Per-dendrite mix 12:3:1 (biological), threshold 0.3 | 56.84 +/- 1.08 | 3 | -0.59 +/- 0.42 |
+| Per-dendrite mix 1:3:12 (Ca-heavy), threshold 0.3 | 57.72 +/- 0.46 | 3 | +0.30 +/- 0.87 |
+
+1. **Replication.** The LeakyReLU baseline reproduces the paper on CIFAR-10. On Fashion-MNIST
+   it reaches 89.13 +/- 0.70 (3 seeds).
+2. **Default constants fail.** With the initial constants every biological variant is at or
+   below the baseline. For Ca the cause is the threshold: at 1.0, 42% of Ca dendrites never
+   switch on (Fashion-MNIST); at 0, 8% do not.
+3. **A steep saturating dendrite wins at 16 x 256.** Ca-only at threshold 0 beats the baseline
+   on CIFAR-10 (table above) and on Fashion-MNIST (89.70 vs 89.13, paired +0.57 +/- 0.10,
+   p = 0.01, 3 of 3 seeds), at equal parameter count.
+4. **It is not specific to Ca spikes.** A tanh dendrite matched to the same curve ties Ca-only
+   (-0.13 pp on the same three seeds). Steepness matters for training: gain 10 is a sweet
+   spot, and gains 1, 3 and 30 give 55.05, 57.03 and 54.58.
+5. **It does not hold at every size.** The paired difference is +0.49 +/- 0.77 at 8 x 128,
+   +0.90 at 16 x 256 and -0.13 +/- 0.51 at 32 x 256 (3 seeds at the outer sizes). At 32 x 256
+   Ca-only overfits: 83% train accuracy against 74% for the baseline.
+6. **The gain survives weight decay.** With decay 1e-4 the paired difference is +1.31 +/- 0.78
+   and with 1e-3 it is +2.95 +/- 0.59 (3 of 3 seeds each), though decay lowers both models'
+   accuracy. Early stopping changes little at 16 x 256.
+7. **Mixing types adds nothing.** V1 mixed is level with the best single type on CIFAR-10 and
+   ties the baseline on Fashion-MNIST (89.24). Among per-dendrite mixes, more Ca dendrites is
+   better and the biological 12:3:1 ratio is the worst.
+8. **The Ca gate is a gain switch, not a coincidence detector.** It gives no advantage; gate
+   values are bimodal and nearly unrelated to basal drive (r = -0.19).
+9. **Trained Ca dendrites are selective.** On CIFAR-10, 78% of outputs sit near 0 or 1 and 85%
+   of dendrites switch between images. On Fashion-MNIST they are more graded (45% near 0 or 1).
+
+Caveats: most comparisons use 3 seeds, the p-values are uncorrected for the number of models
+compared, and the biological variants were tuned while the baseline was tuned only for weight
+decay.
+
 ## V1-style dendritic nonlinearities
 
 `--nonlin v1` replaces each dendrite's LeakyReLU with three fixed nonlinearities applied in
@@ -90,7 +143,7 @@ applied to the learned apical sum, so the apical bias can shift the effective th
 ## Follow-up experiments: is the Ca-only result real, and why?
 
 With a working threshold (`--ca-thresh 0`), Ca-only dendrites beat the LeakyReLU baseline on
-CIFAR-10 at 16 x 256. Four checks, all run through `sweep_constants.sh` grids (section 5e of the
+CIFAR-10 at 16 x 256. Four checks (outcomes are in "Results and conclusions" above), all run through `sweep_constants.sh` grids (section 5e of the
 Colab notebook has the cells):
 
 - **Other sizes.** `SIZES="8x128 32x256" SEEDS="1 2 3"` with grid lines `leaky|` and
@@ -100,8 +153,8 @@ Colab notebook has the cells):
   the synaptic weights can absorb the gain, so `--ca-gain 1 / 3 / 30` only tests sensitivity to
   the initial steepness. The matched control is `--nonlin sub --sub-sat 0.2`:
   `0.2 tanh(5u) = 0.4 sigmoid(10u) - 0.2`, the same curve up to a shift and scale the soma
-  absorbs. If it matches Ca-only, the result is about steep bounded dendrites, not Ca spikes
-  specifically.
+  absorbs. It does match Ca-only, so the result is about steep bounded dendrites, not Ca
+  spikes specifically.
 - **Regularisation.** `--weight-decay W` is Adam's L2 penalty on every parameter, biases
   included (runs are tagged `_wd<W>`; default 0 = the paper). Every run now also saves
   `test_acc_best_val`, the test accuracy at its best-validation epoch (early stopping chosen on
