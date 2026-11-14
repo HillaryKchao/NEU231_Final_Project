@@ -116,6 +116,8 @@ def run_constants(r):
     c = {k: (r.get(k) if r.get(k) is not None else d) for k, d in CONSTANT_DEFAULTS.items()}
     c["basal_nonlin"] = r.get("basal_nonlin") or "leaky"
     c["weight_decay"] = float(r.get("weight_decay") or 0.0)  # files before --weight-decay: 0
+    c["apical_input"] = r.get("apical_input") or "same"      # files before --apical-input: same
+    c["apical_pool"] = int(r.get("apical_pool") or 4)
     return c
 
 
@@ -129,6 +131,9 @@ def constants_parts(consts, nonlin):
             continue  # the paper baseline has no nonlinearity constants
         if float(consts.get(key, default)) != default:
             parts.append(f"{CONSTANT_SHORT[key]}{float(consts[key]):g}")
+    if consts.get("apical_input", "same") != "same":  # any model, the baseline included
+        pool = consts.get("apical_pool", 4)
+        parts.append(f"ap{consts['apical_input']}" + (f"{pool}" if pool != 4 else ""))
     if consts.get("weight_decay"):  # applies to every model, the baseline included
         parts.append(f"wd{float(consts['weight_decay']):g}")
     return parts
@@ -802,6 +807,8 @@ def grid_line(c):
             flags.append(f"--{key.replace('_', '-')} {float(k[key]):g}")
     if k.get("weight_decay"):
         flags.append(f"--weight-decay {float(k['weight_decay']):g}")
+    if k.get("apical_input", "same") != "same":
+        head += f" --apical-input {k['apical_input']}"
     return f"{head}|{' '.join(flags)}"
 
 
@@ -1077,6 +1084,230 @@ def fig_size_generalisation(configs, selected, datasets, out):
 # Ratio experiment: per-dendrite nonlinearity mixes (--nonlin branch --mix S:B:C)
 # ---------------------------------------------------------------------------
 
+TRAIN_SIZE = {"fmnist": 54000, "cifar10": 45000}  # training images after the 10% validation split
+
+
+def has_context(c):
+    return c["constants"].get("apical_input", "same") != "same"
+
+
+def _subset_curves(configs):
+    """{(dataset, sampling, dends, soma): {variant: {n_train: config}}} for --train-subset runs.
+
+    Subset runs must match the paper's other settings; the full-data run of the same variant
+    (if any) is added as the last point. Only groups that include the baseline are returned.
+    """
+    other = {k: v for k, v in PAPER_SETTINGS.items() if k != "train_subset"}
+    ok = [c for c in configs if all(c[k] == v for k, v in other.items()) and not has_context(c)]
+    curves = defaultdict(lambda: defaultdict(dict))
+    for c in ok:
+        if c["train_subset"]:
+            key = (c["dataset"], c["sampling"], c["dends"], c["soma"])
+            pts = curves[key][c["nonlin"]]
+            # several epoch settings for one subset size: keep the one with more seeds
+            if c["train_subset"] not in pts or c["n"] > pts[c["train_subset"]]["n"]:
+                pts[c["train_subset"]] = c
+    for c in ok:
+        key = (c["dataset"], c["sampling"], c["dends"], c["soma"])
+        if not c["train_subset"] and key in curves and c["nonlin"] in curves[key]:
+            curves[key][c["nonlin"]][TRAIN_SIZE[c["dataset"]]] = c
+    return {k: dict(v) for k, v in curves.items() if "leaky" in v}
+
+
+def _efficiency_metric(by_variant, n_train):
+    """'acc_best_by_seed' when every run at this training-set size recorded it, else final."""
+    cs = [pts[n_train] for pts in by_variant.values() if n_train in pts]
+    early = all(set(c["acc_best_by_seed"]) == set(c["acc_by_seed"]) for c in cs)
+    return "acc_best_by_seed" if early else "acc_by_seed"
+
+
+def fig_data_efficiency(configs, datasets, out):
+    """14_data_efficiency.png + data_efficiency.csv: accuracy against training-set size."""
+    curves = {k: v for k, v in _subset_curves(configs).items() if k[0] in datasets}
+    if not curves:
+        print("  skipping 14_data_efficiency.png: no --train-subset runs with a baseline")
+        return []
+    keys = sorted(curves, key=lambda k: (k[0], SAMPLING_ORDER.index(k[1]), k[2] * k[3]))
+    fig, axes = plt.subplots(len(keys), 2, figsize=(10, 3.8 * len(keys)), squeeze=False)
+    rows = []
+    for r, key in enumerate(keys):
+        ds, s, dends, soma = key
+        by_variant = curves[key]
+        ax, axd = axes[r]
+        sizes = sorted({n for pts in by_variant.values() for n in pts})
+        metric = {n: _efficiency_metric(by_variant, n) for n in sizes}
+        variants = sorted(by_variant, key=nonlin_rank)
+        others = [v for v in variants if v != "leaky"]
+        for j, v in enumerate(variants):
+            pts = by_variant[v]
+            ns = sorted(pts)
+            stats = [mean_sd(list(pts[n][metric[n]].values())) for n in ns]
+            b = base_of(v)
+            ax.errorbar(ns, [m for m, _ in stats], yerr=[sd for _, sd in stats],
+                        color=nonlin_color(b), mec=SURFACE, mew=1.2, capsize=3, elinewidth=1.2,
+                        label=nonlin_label(v), **nonlin_style(b))
+            for n, (m, sd) in zip(ns, stats):
+                st = (paired_stats(pts[n][metric[n]], by_variant["leaky"][n][metric[n]])
+                      if v != "leaky" and n in by_variant["leaky"] else None)
+                rows.append({
+                    "dataset": ds, "model": SAMPLING_NAME[s], "size": f"{dends} dends x {soma} somata",
+                    "variant": nonlin_label(v), "train_images": n, "epochs": pts[n]["epochs"],
+                    "seeds": pts[n]["n"], "acc": round(m, 3), "acc_sd": round(sd, 3),
+                    "metric": "early-stop" if metric[n] == "acc_best_by_seed" else "final epoch",
+                    "diff": round(st["mean"], 3) if st else "",
+                    "diff_sd": round(st["sd"], 3) if st else "",
+                    "p": round(st["p"], 4) if st and math.isfinite(st["p"]) else "",
+                    "wins": f"{st['wins']}/{st['n']}" if st else "",
+                })
+                if st is None:
+                    continue
+                k = others.index(v)
+                x = sizes.index(n) + (k - (len(others) - 1) / 2) * 0.8 / max(len(others), 1)
+                axd.errorbar(x, st["mean"], yerr=st["sd"], fmt=nonlin_style(b)["marker"], ms=8,
+                             mfc=nonlin_color(b), mec=SURFACE, mew=1.2, ecolor=nonlin_color(b),
+                             elinewidth=1.3, capsize=4, zorder=4)
+                axd.plot(np.full(st["n"], x + 0.1), st["diffs"], ".", ms=5,
+                         color=nonlin_color(b), alpha=0.55, zorder=3)
+        ax.set_xscale("log")
+        _plain_log_ticks(ax.xaxis)
+        ax.set_xticks(sizes)
+        ax.set_xticklabels([f"{n:,}" for n in sizes])
+        ax.minorticks_off()
+        ax.margins(x=0.08)
+        ax.set_xlabel("Training images (log scale)")
+        ax.set_ylabel("Test accuracy (%)")
+        ax.set_title(f"{DATASET_NAME.get(ds, ds)}, {SAMPLING_NAME[s]} {dends} x {soma}: "
+                     "accuracy by training-set size")
+        ax.legend(loc="lower right")
+        axd.axhline(0, color=MUTED, lw=1)
+        axd.set_xticks(range(len(sizes)))
+        axd.set_xticklabels([f"{n:,}" for n in sizes])
+        axd.set_xlim(-0.6, len(sizes) - 0.4)
+        axd.grid(axis="x", visible=False)
+        axd.margins(y=0.25)
+        axd.set_xlabel("Training images")
+        axd.set_ylabel("Accuracy minus baseline (pp)")
+        axd.set_title("Paired difference, same seeds")
+    _finish(fig, out / "14_data_efficiency.png",
+            "Left: mean and SD over seeds when training on a subset of the images (smaller "
+            "subsets train for more epochs; test accuracy is taken at the best-validation epoch "
+            "where every run recorded it). Right: each model minus the LeakyReLU baseline "
+            "trained on the same images with the same seed.")
+    path = out / "data_efficiency.csv"
+    with path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    print(f"  wrote {path}")
+    print("\nData efficiency: test accuracy (%) by number of training images")
+    wv = max(len(r["variant"]) for r in rows)
+    for r in rows:
+        d = (f"{r['diff']:+6.2f} +/- {r['diff_sd']:4.2f}  p {r['p']}  wins {r['wins']}"
+             if r["diff"] != "" else "")
+        print(f"{r['dataset']:9s} {r['size']:22s} {r['train_images']:>6,d} images  "
+              f"{r['variant']:{wv}s} {r['seeds']:>2d}  {r['acc']:6.2f} +/- {r['acc_sd']:4.2f}  "
+              f"({r['metric']})  {d}")
+    return rows
+
+
+CONTEXT_CELLS = (("leaky", "additive soma, apical sees local patches (paper)"),
+                 ("leaky@apcoarse", "additive soma, apical sees coarse context"),
+                 ("gate", "Ca gate, apical sees local patches"),
+                 ("gate@apcoarse", "Ca gate, apical sees coarse context"))
+
+
+def write_apical_context(configs, datasets, out):
+    """apical_context.csv + 15_apical_context.png: the 2 x 2 of soma type by apical input.
+
+    The gate hypothesis needs more than 'coarse context helps': the gate must gain more from
+    context than an additive soma does. That is the interaction contrast, paired by seed.
+    """
+    groups = defaultdict(dict)
+    for c in configs:
+        if c["dataset"] in datasets and c["nonlin"] in dict(CONTEXT_CELLS):
+            groups[(c["dataset"], c["sampling"], c["dends"], c["soma"])][c["nonlin"]] = c
+    groups = {k: g for k, g in groups.items() if any(has_context(c) for c in g.values())}
+    if not groups:
+        print("  skipping apical_context.csv: no --apical-input coarse runs")
+        return []
+    rows = []
+    keys = sorted(groups, key=lambda k: (k[0], SAMPLING_ORDER.index(k[1]), k[2] * k[3]))
+    fig, axes = plt.subplots(1, len(keys), figsize=(5.2 * len(keys), 3.9), squeeze=False)
+    for ax, key in zip(axes[0], keys):
+        ds, s, dends, soma = key
+        g = groups[key]
+        where = dict(dataset=ds, model=SAMPLING_NAME[s], size=f"{dends} dends x {soma} somata")
+
+        def contrast(name, a, b):
+            if a not in g or b not in g:
+                return
+            st = paired_stats(g[a]["acc_by_seed"], g[b]["acc_by_seed"])
+            if st:
+                rows.append(dict(where, row=name, seeds=st["n"], acc="", acc_sd="",
+                                 diff=round(st["mean"], 3), diff_sd=round(st["sd"], 3),
+                                 p=round(st["p"], 4) if math.isfinite(st["p"]) else "",
+                                 wins=f"{st['wins']}/{st['n']}"))
+
+        for v, label in CONTEXT_CELLS:
+            if v in g:
+                rows.append(dict(where, row=label, seeds=g[v]["n"], acc=round(g[v]["acc"], 3),
+                                 acc_sd=round(g[v]["acc_sd"], 3), diff="", diff_sd="", p="", wins=""))
+        contrast("context effect, additive soma", "leaky@apcoarse", "leaky")
+        contrast("context effect, Ca gate", "gate@apcoarse", "gate")
+        contrast("gate effect, local apical input", "gate", "leaky")
+        contrast("gate effect, coarse apical input", "gate@apcoarse", "leaky@apcoarse")
+        if all(v in g for v, _ in CONTEXT_CELLS):  # (gate: coarse - local) - (additive: coarse - local)
+            seeds = set.intersection(*(set(g[v]["acc_by_seed"]) for v, _ in CONTEXT_CELLS))
+            a = {k: g["gate@apcoarse"]["acc_by_seed"][k] - g["gate"]["acc_by_seed"][k] for k in seeds}
+            b = {k: g["leaky@apcoarse"]["acc_by_seed"][k] - g["leaky"]["acc_by_seed"][k] for k in seeds}
+            st = paired_stats(a, b)
+            if st:
+                rows.append(dict(where, row="interaction: does the gate gain more from context?",
+                                 seeds=st["n"], acc="", acc_sd="", diff=round(st["mean"], 3),
+                                 diff_sd=round(st["sd"], 3),
+                                 p=round(st["p"], 4) if math.isfinite(st["p"]) else "",
+                                 wins=f"{st['wins']}/{st['n']}"))
+        for soma_type, color, name in (("leaky", NONLIN_COLOR["leaky"], "additive soma"),
+                                       ("gate", NONLIN_COLOR["gate"], "Ca gate")):
+            cells = [(i, g[v]) for i, v in enumerate((soma_type, soma_type + "@apcoarse")) if v in g]
+            if not cells:
+                continue
+            ax.errorbar([i for i, _ in cells], [c["acc"] for _, c in cells],
+                        yerr=[c["acc_sd"] for _, c in cells], color=color, mec=SURFACE, mew=1.2,
+                        capsize=4, elinewidth=1.3, label=name, **NONLIN_STYLE[soma_type])
+            for i, c in cells:
+                ax.plot(np.full(c["n"], i + (0.07 if soma_type == "gate" else -0.07)),
+                        list(c["acc_by_seed"].values()), ".", ms=5, color=color, alpha=0.55)
+        ax.set_xticks([0, 1])
+        ax.set_xticklabels(["local patches\n(same as basal)", "coarse context\n(pooled image)"])
+        ax.set_xlim(-0.5, 1.5)
+        ax.grid(axis="x", visible=False)
+        ax.margins(y=0.2)
+        ax.set_xlabel("What the apical dendrites see")
+        ax.set_ylabel("Test accuracy (%)")
+        ax.set_title(f"{DATASET_NAME.get(ds, ds)}, {dends} x {soma}")
+        ax.legend(loc="best")
+    _finish(fig, out / "15_apical_context.png",
+            "Mean and SD over seeds (dots: individual seeds). Parallel lines mean context helps "
+            "any soma equally; the gate line rising more steeply would mean the multiplicative "
+            "gate makes specific use of context.")
+    path = out / "apical_context.csv"
+    with path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    print(f"  wrote {path}")
+    print("\nApical context, 2 x 2 (soma type by apical input): test accuracy (%) and paired contrasts (pp)")
+    wr = max(len(r["row"]) for r in rows)
+    for r in rows:
+        if r["acc"] != "":
+            val = f"{r['acc']:6.2f} +/- {r['acc_sd']:4.2f}"
+        else:
+            val = f"{r['diff']:+6.2f} +/- {r['diff_sd']:4.2f}  p {r['p']}  wins {r['wins']}"
+        print(f"{r['dataset']:9s} {r['size']:22s} {r['row']:{wr}s} {r['seeds']:>2d}  {val}")
+    return rows
+
+
 def _size_groups(configs):
     """(dataset, sampling, dends, soma) -> {variant: config}, sorted."""
     groups = defaultdict(dict)
@@ -1271,7 +1502,10 @@ def main():
     if not runs:
         raise SystemExit(f"No results found in {args.results}/. Run base_model.py first.")
     configs = group_runs(runs)
-    comparable = [c for c in configs if paper_comparable(c)]
+    # Models whose apical dendrites read a coarse view are a separate experiment: they get
+    # their own table and figure and stay out of the comparisons with the paper.
+    context_all = [c for c in configs if paper_comparable(c)]
+    comparable = [c for c in context_all if not has_context(c)]
     skipped = len(configs) - len(comparable)
     print(f"Loaded {len(runs)} runs = {len(configs)} model configurations"
           + (f" ({skipped} left out: settings differ from the paper's)" if skipped else ""))
@@ -1304,6 +1538,8 @@ def main():
     write_ratio_sweep(selected, out)
     write_constants_sweep(comparable, out)
     write_paired(comparable, selected, out)
+    fig_data_efficiency(configs, datasets, out)
+    write_apical_context(context_all, datasets, out)
 
 
 if __name__ == "__main__":

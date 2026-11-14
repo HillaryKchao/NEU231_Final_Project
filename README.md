@@ -13,7 +13,9 @@ python base_model.py --dataset fmnist --dends 16 --soma 128 --sampling local
 **In short:** the replication matches the paper, and biologically inspired dendritic
 nonlinearities do not meaningfully improve on its LeakyReLU dendrite. The one variant that
 wins is a steep saturating dendrite, by about one point at the paper's model size; the gain
-disappears at a larger size and is not specific to calcium spikes.
+disappears at a larger size and is not specific to calcium spikes. Where the nonlinearity
+does matter is robustness: on corrupted Fashion-MNIST images the dendrite type changes
+accuracy by up to 10 points, in different directions for noise and for occlusion.
 
 All numbers are test accuracy (%) for dANN-LRF, mean +/- SD over seeds, at 16 dendrites x 256
 somata unless stated. "Paired" differences compare runs with the same seed (same data split
@@ -56,6 +58,37 @@ and wiring). Tables: `figures/cifar10/` and `figures/control1/` (Fashion-MNIST),
    values are bimodal and nearly unrelated to basal drive (r = -0.19).
 9. **Trained Ca dendrites are selective.** On CIFAR-10, 78% of outputs sit near 0 or 1 and 85%
    of dendrites switch between images. On Fashion-MNIST they are more graded (45% near 0 or 1).
+
+10. **Dendrite type matters for robustness, and it cuts both ways** (Fashion-MNIST, models
+    trained on clean images, paired difference from the baseline over 3 seeds;
+    `figures/control1/13_robustness.png`):
+
+    | Model | Noise SD 0.2 | Noise SD 0.3 | 25% occluded | 40% occluded |
+    |---|---|---|---|---|
+    | supra-only | +9.5 | +10.9 | +0.8 | +1.0 |
+    | Ca-only, threshold 0 | -9.4 | -5.9 | +3.1 | +4.1 |
+    | Matched tanh | -8.3 | -3.5 | +3.3 | +4.4 |
+    | Additive soma, coarse apical input | +2.6 | +2.3 | 0.0 | +1.3 |
+    | Ca gate | -3.0 | -3.4 | -1.5 | -1.5 |
+    | Ca gate, coarse apical input | +2.4 | +1.7 | +0.5 | +1.2 |
+
+    Supralinear dendrites are much more tolerant of pixel noise (3 of 3 seeds, p = 0.01 at
+    SD 0.2). Steep saturating dendrites are much less tolerant of noise but more tolerant of
+    occlusion (3 of 3 seeds, p = 0.01 or below), and the matched tanh behaves the same way,
+    again showing the two are one function. Not yet run on CIFAR-10.
+11. **No data-efficiency advantage.** Trained on 1,000, 5,000 or 20,000 Fashion-MNIST images,
+    Ca-only and the matched tanh keep the same small edge over the baseline (+0.2 to +0.5 pp,
+    3 of 3 seeds at every size); it does not grow as data shrinks (`14_data_efficiency.png`).
+12. **Giving the apical dendrites context does not rescue the gate** (Fashion-MNIST, 3 seeds,
+    `15_apical_context.png`). Additive soma: 89.13 with local and 89.08 with coarse apical
+    input. Ca gate: 89.43 and 89.24. The interaction (does the gate gain more from context?)
+    is -0.14 +/- 0.22 pp. Coarse context does give a small noise-robustness benefit to either
+    soma type (table above). In the gate ablation, shuffling the gate across images costs the
+    local-input gate 2.6 to 4.5 pp but the coarse-input gate only 0.7 to 1.4 pp, so the network
+    relies on the gate less when it carries context. That ablation also shows the gate is not
+    purely a gain switch on Fashion-MNIST: its values are image-specific even though they are
+    uncorrelated with basal drive. Fashion-MNIST is near these models' ceiling; CIFAR-10 is
+    not yet run.
 
 Caveats: most comparisons use 3 seeds, the p-values are uncorrected for the number of models
 compared, and the biological variants were tuned while the baseline was tuned only for weight
@@ -168,6 +201,48 @@ they share (same seed = same data split and wiring), with the SD of the differen
 t-test and the number of seeds won. Decayed models are paired with the equally decayed
 baseline. The p-values are not corrected for the number of models compared; with 3 to 5 seeds
 they are suggestive, not conclusive.
+
+## Beyond clean accuracy: robustness, data efficiency and apical context
+
+Clean test accuracy barely separates the models, so three further experiments ask where
+dendritic nonlinearities might matter instead (Colab notebook section 5f has the CIFAR-10 cells).
+
+**Robustness.** `robustness.py` trains nothing: it evaluates every 16 x 256 run that has
+saved weights on corrupted test images, Gaussian pixel noise (SD 0.05 to 0.5) and a grey
+square covering 10 to 40% of the image. The corruption is generated once from a fixed seed
+and is the same for every model. Output: `13_robustness.png`, `robustness.csv` and
+`robustness_paired.csv` (each model minus the baseline with the same seed, per level).
+
+    python robustness.py --dataset fmnist --out figures/control1
+
+**Data efficiency.** Baseline, Ca-only threshold 0 and the matched tanh trained on 1,000,
+5,000 and 20,000 images (`--train-subset N`, with 200, 100 and 50 epochs so small subsets are
+not simply under-trained) and compared at each run's best-validation epoch.
+`plot_results.py` draws `14_data_efficiency.png` and writes `data_efficiency.csv`; subset runs
+stay out of every other table.
+
+    GRID=grid.txt SEEDS="1 2 3" EXTRA="--train-subset 1000 --epochs 200" bash sweep_constants.sh
+
+**Apical context (`--apical-input coarse`).** In the Ca gate model the apical and basal
+dendrites both read local patches of the same image, so the gate has no second signal to
+detect a coincidence with. With `--apical-input coarse`, each soma's apical dendrites (the
+last `--apical-frac` of its dendrites, 4 of 16) take their synapses from a 4x average-pooled
+copy of the image (`--apical-pool`), a low-resolution wide-field view like the contextual
+input the apical tuft receives in cortex. Basal dendrites keep their local receptive fields
+and their wiring for a given seed; pooling has no parameters and every dendrite keeps 16
+synapses, so the parameter count is unchanged. (The first layer's input is longer, so its
+initial weights are not identical to the baseline's for the same seed.) Runs are tagged
+`_apcoarse`.
+
+The flag works with any `--nonlin`, which gives a 2 x 2 design: additive soma (`leaky`) or
+multiplicative gate (`gate`), each with local or coarse apical input. Coarse context helping
+both equally would mean the benefit is the extra view; the gate idea is supported only if
+gate + context beats additive + context. `plot_results.py` writes `apical_context.csv` with
+the four cells, the paired contrasts and their interaction, and `15_apical_context.png`.
+These runs are kept out of the comparisons with the paper. For gate runs `analyze_v1.py` now
+also reports a gate ablation: test accuracy with the gate shuffled across images (same values,
+wrong images), fixed at each soma's mean, and closed. Intact minus shuffled is the
+image-specific information the gate carries.
 
 ## CIFAR-10 on Colab
 

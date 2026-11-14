@@ -43,12 +43,16 @@ CHANNEL_COLOR = {"supra": COLOR["global"], "sub": COLOR["local"], "ca": COLOR["r
 BANK_NONLINS = ("v1", "supra", "sub", "ca", "branch", "gate")
 
 
-def load(tag):
-    """Rebuild the model from its results JSON and load the saved weights (CPU)."""
+def load(tag, require_bank=True):
+    """Rebuild the model from its results JSON and load the saved weights (CPU).
+
+    require_bank=False also accepts the LeakyReLU baseline (robustness.py evaluates it).
+    """
     tag = Path(str(tag).removesuffix(".json").removesuffix(".pt"))
-    r = json.loads(tag.with_suffix(".json").read_text())
+    # not with_suffix: tags contain dots (..._sat0.2_seed1), which it would cut at
+    r = json.loads(Path(f"{tag}.json").read_text())
     nonlin = r.get("nonlin", "leaky")
-    if nonlin not in BANK_NONLINS:
+    if require_bank and nonlin not in BANK_NONLINS:
         raise SystemExit(f"{tag.name} is a {nonlin} run; this script needs one of {BANK_NONLINS}")
     img_shape, channels = IMG[r["dataset"]]
     consts = {k: (r.get(k) if r.get(k) is not None else d) for k, d in CONSTANT_DEFAULTS.items()}
@@ -57,10 +61,43 @@ def load(tag):
                          synapses=r["synapses"], layers=r["layers"], sampling=r["sampling"],
                          seed=r["seed"], nonlin=nonlin, mix=r.get("mix", "1:1:1"),
                          nonlin_params=consts, basal_nonlin=r.get("basal_nonlin") or "leaky",
-                         apical_frac=apical_frac)
-    model.load_state_dict(torch.load(tag.with_suffix(".pt"), map_location="cpu"))
+                         apical_frac=apical_frac, apical_input=r.get("apical_input") or "same",
+                         apical_pool=r.get("apical_pool") or 4)
+    model.load_state_dict(torch.load(f"{tag}.pt", map_location="cpu"))
     model.eval()
     return model, r
+
+
+def layer0_input(model, x):
+    """What the first dendritic layer reads: the image, plus the pooled view if apical is coarse."""
+    return model.with_coarse_view(x) if model.coarse is not None else x
+
+
+@torch.no_grad()
+def gate_ablation(model, data, batch=2000):
+    """Test accuracy with the gate intact, shuffled across images, and fixed at its mean.
+
+    Shuffling keeps every soma's distribution of gate values but breaks the link to the image,
+    so the drop from intact to shuffled is the image-specific information the gate carries.
+    Single-layer models only.
+    """
+    g0 = model.soma_layers[0]
+    x, y = torch.as_tensor(data["test"][0]), torch.as_tensor(data["test"][1])
+    basal, gate = [], []
+    for i in range(0, len(x), batch):
+        h = model.dend_act(model.dend_layers[0](layer0_input(model, x[i:i + batch])))
+        basal.append(g0.basal(h))
+        g0(h)
+        gate.append(g0.last_gate)
+    basal, gate = torch.cat(basal), torch.cat(gate)
+    perm = torch.randperm(len(x), generator=torch.Generator().manual_seed(0))
+
+    def acc(gt):
+        logits = model.output(model.soma_act(basal * (1 + g0.ca_amp * gt)))
+        return 100 * (logits.argmax(1) == y).float().mean().item()
+
+    return dict(intact=acc(gate), shuffled=acc(gate[perm]),
+                mean=acc(gate.mean(0, keepdim=True).expand_as(gate)), closed=acc(torch.zeros_like(gate)))
 
 
 @torch.no_grad()
@@ -78,7 +115,7 @@ def report_gate(model, r, data_dir, out, n=2048, make_fig=True):
         return
     data, *_ = load_data(r["dataset"], data_dir, seed=r["seed"])
     x = torch.as_tensor(data["val"][0][:n])
-    h = model.dend_act(model.dend_layers[0](x))
+    h = model.dend_act(model.dend_layers[0](layer0_input(model, x)))
     basal = g0.basal(h)
     g0(h)  # sets last_gate
     gate = g0.last_gate                                   # (n, soma) in [0, 1]
@@ -88,6 +125,13 @@ def report_gate(model, r, data_dir, out, n=2048, make_fig=True):
           f"frac of somata with mean gate > 0.5 {(gate.mean(0) > 0.5).float().mean():.3f}")
     print(f"    amplification (1 + g*Ca): mean {(1 + g0.ca_amp * gate).mean():.3f}; "
           f"corr(basal drive, gate) {corr:.3f}")
+    if len(model.soma_layers) == 1:
+        ab = gate_ablation(model, data)
+        print(f"    gate ablation, test acc: intact {ab['intact']:.2f}%  |  gate shuffled across "
+              f"images {ab['shuffled']:.2f}%  |  gate fixed at each soma's mean {ab['mean']:.2f}%"
+              f"  |  gate closed {ab['closed']:.2f}%")
+        print(f"    image-specific contribution of the gate (intact - shuffled): "
+              f"{ab['intact'] - ab['shuffled']:+.2f} pp")
     if (gate > 0.5).float().mean() < 1e-3:
         print("    note: the gate almost never opens; try a lower --ca-thresh")
     if (gate > 0.5).float().mean() > 0.999:
@@ -150,7 +194,7 @@ def report_activity(model, r, data_dir, n=2048):
     data, *_ = load_data(r["dataset"], data_dir, seed=r["seed"])
     x = torch.as_tensor(data["val"][0][:n])
     act = model.dend_act
-    u = model.dend_layers[0](x)                          # (n, D)
+    u = model.dend_layers[0](layer0_input(model, x))  # (n, D)
     h = act(u)                                           # (n, n_ch * D)
     W = model.soma_layers[0].weight * model.soma_layers[0].mask  # (n_ch * D, soma)
     groups = row_groups(act, u.shape[1])
@@ -187,7 +231,7 @@ def report_dendrite_states(model, r, data_dir, out, n=2048, make_fig=True):
         return
     data, *_ = load_data(r["dataset"], data_dir, seed=r["seed"])
     x = torch.as_tensor(data["val"][0][:n])
-    u = model.dend_layers[0](x)                                    # (n, D)
+    u = model.dend_layers[0](layer0_input(model, x))  # (n, D)
     if hasattr(act, "type_idx"):                                   # branch: only the Ca dendrites
         u = u[:, act.type_idx == list(act.channels).index("ca")]
     if u.shape[1] == 0:

@@ -322,6 +322,18 @@ class BranchTypeNonlinearity(nn.Module):
         return f"mix={self.mix} -> counts {self.counts} per soma; {self.bank.extra_repr()}"
 
 
+def apical_flags(dends, soma, apical_frac):
+    """Which dendrites are apical: the last round(apical_frac * dends) of every soma's block.
+
+    Returns a boolean array of length dends * soma. Shared by the Ca gate and --apical-input so
+    the two always mean the same dendrites.
+    """
+    n_apical = max(1, int(round(apical_frac * dends)))
+    if n_apical >= dends:
+        raise ValueError(f"apical_frac {apical_frac} leaves no basal dendrites at {dends} dendrites")
+    return np.array(([False] * (dends - n_apical) + [True] * n_apical) * soma)
+
+
 class CaGateSoma(nn.Module):
     """Soma whose basal drive is multiplied by an apical Ca2+ plateau (BAC-firing-like).
 
@@ -343,12 +355,10 @@ class CaGateSoma(nn.Module):
 
     def __init__(self, dends, soma, apical_frac=0.25, ca_thresh=1.0, ca_gain=10.0, ca_amp=1.0):
         super().__init__()
-        n_apical = max(1, int(round(apical_frac * dends)))
-        if n_apical >= dends:
-            raise ValueError(f"apical_frac {apical_frac} leaves no basal dendrites at {dends} dendrites")
+        is_apical = apical_flags(dends, soma, apical_frac)  # (D,)
+        n_apical = int(is_apical[:dends].sum())
         self.n_basal, self.n_apical = dends - n_apical, n_apical
         self.ca_thresh, self.ca_gain, self.ca_amp = float(ca_thresh), float(ca_gain), float(ca_amp)
-        is_apical = np.array(([False] * self.n_basal + [True] * n_apical) * soma)  # (D,)
         cm = cable_mask(dends, soma)
         self.basal = MaskedLinear(dends * soma, soma, cm * (~is_apical)[:, None])
         self.apical = MaskedLinear(dends * soma, soma, cm * is_apical[:, None])
@@ -413,6 +423,14 @@ class DendriticANN(nn.Module):
         dendrites use `basal_nonlin` (LeakyReLU by default); each soma's basal drive is
         multiplied by (1 + g * Ca) where Ca is a plateau on its apical dendrites' drive.
         Same masked weights as the baseline plus one extra bias vector per layer.
+
+    apical_input="coarse" (any nonlin): in the first layer, each soma's apical dendrites (the
+        last apical_frac of its dendrites) take their synapses from an average-pooled copy of
+        the image (apical_pool x apical_pool blocks) instead of from the image itself: a
+        low-resolution, wide-field "context" view, as the apical tuft receives in cortex.
+        Basal dendrites keep the wiring they have with apical_input="same". Pooling has no
+        parameters and every dendrite keeps `synapses` inputs, so the parameter count is
+        unchanged.
     """
 
     NONLINS = ("leaky", "v1", "supra", "sub", "ca", "branch", "gate")
@@ -420,8 +438,10 @@ class DendriticANN(nn.Module):
     def __init__(self, img_shape, channels, num_classes, dends=16, soma=128,
                  synapses=16, layers=1, sampling="local", relu_slope=0.1, seed=0,
                  nonlin="leaky", nonlin_params=None, mix="1:1:1", basal_nonlin="leaky",
-                 apical_frac=0.25):
+                 apical_frac=0.25, apical_input="same", apical_pool=4):
         super().__init__()
+        if apical_input not in ("same", "coarse"):
+            raise ValueError("apical_input must be 'same' or 'coarse'")
         if nonlin not in self.NONLINS:
             raise ValueError(f"nonlin must be one of {self.NONLINS}")
         if basal_nonlin not in ("leaky",) + V1DendriticNonlinearity.CHANNELS:
@@ -438,8 +458,21 @@ class DendriticANN(nn.Module):
 
         shape, ch = img_shape, channels
         n_in = shape[0] * shape[1] * ch
-        for _ in range(layers):
+        self.coarse = None  # (rows, cols, channels, pool) of the image when apical input is coarse
+        for layer in range(layers):
             syn = synaptic_mask(shape, dends, soma, synapses, ch, sampling, rng)
+            if apical_input == "coarse" and layer == 0:
+                # the fine mask above used the same rng draws as apical_input="same", so basal
+                # wiring is identical for a given seed; the coarse mask has its own rng
+                if shape[0] % apical_pool or shape[1] % apical_pool:
+                    raise ValueError(f"apical_pool {apical_pool} does not divide image {shape}")
+                c_shape = (shape[0] // apical_pool, shape[1] // apical_pool)
+                c_syn = synaptic_mask(c_shape, dends, soma, synapses, ch, sampling,
+                                      np.random.default_rng([seed, 1]))
+                is_apical = apical_flags(dends, soma, apical_frac)
+                syn = np.vstack([syn * ~is_apical[None, :], c_syn * is_apical[None, :]])
+                n_in += c_shape[0] * c_shape[1] * ch
+                self.coarse = (shape[0], shape[1], ch, apical_pool)
             self.dend_layers.append(MaskedLinear(n_in, dends * soma, syn))
             if nonlin == "gate":
                 self.soma_layers.append(CaGateSoma(dends, soma, apical_frac, **gate_params))
@@ -469,7 +502,16 @@ class DendriticANN(nn.Module):
             self.dend_act = V1DendriticNonlinearity(channels=(nonlin,), **params)
         self.soma_act = nn.LeakyReLU(relu_slope)
 
+    def with_coarse_view(self, x):
+        """Append the average-pooled image (channels-last, like the input) to the flat input."""
+        M, N, ch, pool = self.coarse
+        img = x.view(len(x), M, N, ch).permute(0, 3, 1, 2)
+        pooled = F.avg_pool2d(img, pool).permute(0, 2, 3, 1).reshape(len(x), -1)
+        return torch.cat([x, pooled], dim=1)
+
     def forward(self, x):
+        if self.coarse is not None:
+            x = self.with_coarse_view(x)
         for dend, soma in zip(self.dend_layers, self.soma_layers):
             x = self.dend_act(dend(x))
             x = self.soma_act(soma(x))
@@ -612,15 +654,21 @@ def train(model, data, epochs, lr, batch_size, device, seed, weight_decay=0.0):
 def run_tag(args):
     """Results file stem. The paper baseline keeps its original tag; other nonlinearities are
     named (dann_v1_..., dann_branch12-3-1_..., dann_gate_bsupra_...), non-default constants
-    add a suffix (_thr0.5_leak0.1), --weight-decay adds _wd<value> (for any model, the baseline
+    add a suffix (_thr0.5_leak0.1), --apical-input coarse adds _apcoarse, --weight-decay adds _wd<value> (for any model, the baseline
     included) and --train-subset adds _nN."""
     nl = "" if args.nonlin == "leaky" else f"_{args.nonlin}"
     if args.nonlin == "branch":
         nl += args.mix.replace(":", "-")
     if args.nonlin == "gate" and args.basal_nonlin != "leaky":
         nl += f"_b{args.basal_nonlin}"
+    ap = ""
+    if getattr(args, "apical_input", "same") != "same":
+        pool = getattr(args, "apical_pool", 4)
+        ap = f"_ap{args.apical_input}" + (f"{pool}" if pool != 4 else "")
+        if args.nonlin != "gate" and args.apical_frac != CONSTANT_DEFAULTS["apical_frac"]:
+            ap += f"_ap{args.apical_frac:g}"  # the gate already tags its apical fraction
     return (f"dann{nl}_{args.sampling}_{args.dataset}_L{args.layers}_d{args.dends}_s{args.soma}"
-            f"{constants_suffix(vars(args), args.nonlin)}"
+            f"{constants_suffix(vars(args), args.nonlin)}{ap}"
             + (f"_wd{args.weight_decay:g}" if getattr(args, "weight_decay", 0) else "")
             + f"_seed{args.seed}"
             + (f"_n{args.train_subset}" if args.train_subset else ""))
@@ -657,6 +705,13 @@ def main():
                     help="nonlinearity of the dendrites (basal and apical) in the gate model")
     gg.add_argument("--apical-frac", type=float, default=0.25,
                     help="fraction of each soma's dendrites that are apical (0.25 of 16 = 4)")
+    ga = p.add_argument_group("apical context (any --nonlin)")
+    ga.add_argument("--apical-input", default="same", choices=["same", "coarse"],
+                    help="what the apical dendrites (the last --apical-frac of each soma's) read: "
+                         "same = local patches of the image like every dendrite (default); "
+                         "coarse = an average-pooled, low-resolution copy of the image")
+    ga.add_argument("--apical-pool", type=int, default=4,
+                    help="pooling block size of the coarse apical view (4: 28x28 -> 7x7)")
     p.add_argument("--epochs", type=int, default=None, help="default: 25 fmnist, 50 cifar10")
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--batch-size", type=int, default=128)
@@ -691,7 +746,8 @@ def main():
                          synapses=args.synapses, layers=args.layers, sampling=args.sampling,
                          seed=args.seed, nonlin=args.nonlin, nonlin_params=nonlin_params,
                          mix=args.mix, basal_nonlin=args.basal_nonlin,
-                         apical_frac=args.apical_frac).to(device)
+                         apical_frac=args.apical_frac, apical_input=args.apical_input,
+                         apical_pool=args.apical_pool).to(device)
 
     print(f"dANN-{args.sampling} | {args.nonlin} dendrites | {args.dataset} | {args.layers} layer(s) | "
           f"{args.dends} dends x {args.soma} somata | {model.n_params():,} trainable params | {device}")
